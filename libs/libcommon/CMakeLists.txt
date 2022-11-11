@@ -176,6 +176,11 @@ check_then_add_sources_compile_flag (
     "-mmovbe" 
     src/avx2_mem_utils_impl.cpp
 )
+check_then_add_sources_compile_flag (
+    TIFLASH_COMPILER_BMI_SUPPORT
+    "-mbmi" 
+    src/avx2_mem_utils_impl.cpp
+)
 
 set_property(SOURCE src/avx2_mem_utils_impl.cpp APPEND PROPERTY COMPILE_OPTIONS "-fomit-frame-pointer") # remove frame pointer
 

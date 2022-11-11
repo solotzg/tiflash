@@ -21,7 +21,11 @@ add_headers_and_sources(clickhouse_functions ${TiFlash_BINARY_DIR}/dbms/src/Func
 
 check_then_add_sources_compile_flag (TIFLASH_ENABLE_AVX_SUPPORT "-mavx2" CollationStringOptimized.cpp)
 check_then_add_sources_compile_flag (TIFLASH_COMPILER_MOVBE_SUPPORT "-mmovbe" CollationStringOptimized.cpp)
-
+check_then_add_sources_compile_flag (
+    TIFLASH_COMPILER_BMI_SUPPORT
+    "-mbmi" 
+    CollationStringOptimized.cpp
+)
 list(REMOVE_ITEM clickhouse_functions_sources IFunction.cpp FunctionFactory.cpp FunctionHelpers.cpp)
 list(REMOVE_ITEM clickhouse_functions_headers IFunction.h FunctionFactory.h FunctionHelpers.h)
 

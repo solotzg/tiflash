@@ -32,7 +32,7 @@ template <typename T>
 ALWAYS_INLINE static inline T clear_rightmost_bit_one(const T value)
 {
     assert(value != 0);
-
+    // recommended to use compile flag `-mbmi` under AMD64 platform
     return value & (value - 1);
 }
 
@@ -96,9 +96,25 @@ FLATTEN_INLINE_PURE static inline uint32_t get_block32_cmp_eq_mask(const void * 
     uint32_t mask = _mm256_movemask_epi8(_mm256_cmpeq_epi8(load_block32(p1), load_block32(p2)));
     return mask;
 }
+FLATTEN_INLINE_PURE static inline uint32_t get_block32_cmp_eq_mask(
+    const void * s,
+    const Block32 & check_block)
+{
+    const auto block = load_block32(s);
+    uint32_t mask = _mm256_movemask_epi8(_mm256_cmpeq_epi8(block, check_block));
+    return mask;
+}
 FLATTEN_INLINE_PURE static inline uint32_t get_block16_cmp_eq_mask(const void * p1, const void * p2)
 {
     uint32_t mask = _mm_movemask_epi8(_mm_cmpeq_epi8(load_block16(p1), load_block16(p2)));
+    return mask;
+}
+FLATTEN_INLINE_PURE static inline uint32_t get_block16_cmp_eq_mask(
+    const void * s,
+    const Block16 & check_block)
+{
+    const auto block = load_block16(s);
+    uint32_t mask = _mm_movemask_epi8(_mm_cmpeq_epi8(block, check_block));
     return mask;
 }
 FLATTEN_INLINE_PURE static inline bool check_block32_eq(const char * a, const char * b)
