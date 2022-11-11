@@ -109,6 +109,11 @@ add_sources_compile_flag_avx2 (
     src/Columns/ColumnString.cpp
     src/Columns/ColumnsCommon.cpp
 )
+check_then_add_sources_compile_flag (
+    TIFLASH_COMPILER_BMI_SUPPORT
+    "-mbmi" 
+    src/Columns/ColumnsCommon.cpp
+)
 
 list (APPEND clickhouse_common_io_sources ${CONFIG_BUILD})
 list (APPEND clickhouse_common_io_headers ${CONFIG_VERSION} ${CONFIG_COMMON})

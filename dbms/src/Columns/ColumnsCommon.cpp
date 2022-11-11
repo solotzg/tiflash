@@ -89,7 +89,7 @@ size_t countBytesInFilter(const IColumn::Filter & filt)
     return countBytesInFilter(filt.data(), 0, filt.size());
 }
 
-static inline size_t _count_bytes_in_filter_with_null(const Int8 * p1, const Int8 * p2, size_t size)
+static inline size_t count_bytes_in_filter_with_null(const Int8 * p1, const Int8 * p2, size_t size)
 {
     size_t count = 0;
     for (size_t i = 0; i < size; ++i)
@@ -120,7 +120,7 @@ static inline size_t countBytesInFilterWithNull(const IColumn::Filter & filt, co
         size -= 64;
     }
 #endif
-    count += _count_bytes_in_filter_with_null(pos, pos2, size);
+    count += count_bytes_in_filter_with_null(pos, pos2, size);
     return count;
 }
 
