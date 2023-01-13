@@ -17,9 +17,7 @@
 #include <Common/UnaryCallback.h>
 #include <Common/grpcpp.h>
 #include <Flash/Coprocessor/ChunkCodec.h>
-#include <Flash/Mpp/LocalRequestHandler.h>
 #include <Flash/Mpp/MPPTaskManager.h>
-#include <Flash/Mpp/ReceiverChannelWriter.h>
 #include <Storages/StorageDisaggregated.h>
 #include <common/types.h>
 #include <grpcpp/completion_queue.h>
@@ -86,7 +84,7 @@ public:
 
     bool supportAsync(const ExchangeRecvRequest & request) const;
 
-    ExchangePacketReaderPtr makeSyncReader(const ExchangeRecvRequest & request) const;
+    ExchangePacketReaderPtr makeReader(const ExchangeRecvRequest & request) const;
 
     void makeAsyncReader(
         const ExchangeRecvRequest & request,
@@ -100,8 +98,6 @@ public:
     }
 
     void fillSchema(DAGSchema & schema) const;
-
-    void establishMPPConnectionLocal(const ExchangeRecvRequest & request, size_t source_index, LocalRequestHandler & local_request_handler, bool is_fine_grained);
 
     // Only for tiflash_compute mode, make sure disaggregated_dispatch_reqs is not empty.
     void sendMPPTaskToTiFlashStorageNode(
