@@ -144,7 +144,6 @@ struct MockReceiverContext
         int source_index = 0;
         int send_task_id = 0;
         int recv_task_id = -1;
-        bool is_local = false;
     };
 
     struct Reader
@@ -209,22 +208,22 @@ struct MockReceiverContext
         }
     }
 
-    static Request makeRequest(int index)
+    Request makeRequest(int index) const
     {
         return {index, index, -1};
     }
 
-    std::shared_ptr<Reader> makeSyncReader(const Request &)
+    std::shared_ptr<Reader> makeReader(const Request &)
     {
         return std::make_shared<Reader>(queue);
     }
 
-    static void cancelMPPTaskOnTiFlashStorageNode(LoggerPtr)
+    void cancelMPPTaskOnTiFlashStorageNode(LoggerPtr)
     {
         throw Exception("cancelMPPTaskOnTiFlashStorageNode not implemented for MockReceiverContext");
     }
 
-    static void sendMPPTaskToTiFlashStorageNode(LoggerPtr, const std::vector<StorageDisaggregated::RequestAndRegionIDs> &)
+    void sendMPPTaskToTiFlashStorageNode(LoggerPtr, const std::vector<StorageDisaggregated::RequestAndRegionIDs> &)
     {
         throw Exception("sendMPPTaskToTiFlashStorageNode not implemented for MockReceiverContext");
     }
@@ -234,15 +233,12 @@ struct MockReceiverContext
         return ::grpc::Status();
     }
 
-    static bool supportAsync(const Request &) { return false; }
-
+    bool supportAsync(const Request &) const { return false; }
     void makeAsyncReader(
         const Request &,
         std::shared_ptr<AsyncReader> &,
         grpc::CompletionQueue *,
         UnaryCallback<bool> *) const {}
-
-    void establishMPPConnectionLocal(const MockReceiverContext::Request &, size_t, LocalRequestHandler &, bool) {}
 
     PacketQueuePtr queue;
     std::vector<tipb::FieldType> field_types{};
