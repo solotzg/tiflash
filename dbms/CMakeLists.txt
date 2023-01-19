@@ -112,6 +112,7 @@ check_then_add_sources_compile_flag (
     src/Columns/ColumnsCommon.cpp
     src/Columns/ColumnVector.cpp
     src/DataTypes/DataTypeString.cpp
+    src/IO/LZ4_decompress_faster.cpp
 )
 
 list (APPEND clickhouse_common_io_sources ${CONFIG_BUILD})
