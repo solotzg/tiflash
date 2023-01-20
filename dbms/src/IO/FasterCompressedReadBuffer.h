@@ -21,7 +21,8 @@
 namespace LZ4
 {
 struct StreamStatistics;
-}
+struct PerformanceStatistics;
+} // namespace LZ4
 namespace DB
 {
 class FasterCompressedReadBuffer : public CompressedReadBufferBase<false>
@@ -43,7 +44,7 @@ public:
 
 private:
     size_t size_compressed = 0;
-    LZ4::StreamStatistics & statistics;
+    LZ4::PerformanceStatistics & statistics;
 };
 
 } // namespace DB
