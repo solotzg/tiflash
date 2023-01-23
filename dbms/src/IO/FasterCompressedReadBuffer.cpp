@@ -15,12 +15,19 @@
 #include <IO/CompressedStream.h>
 #include <IO/FasterCompressedReadBuffer.h>
 #include <IO/LZ4_decompress_faster.h>
+#include <IO/WriteHelpers.h>
 #include <common/types.h>
 
 
 namespace DB
 {
-FasterCompressedReadBuffer::FasterCompressedReadBuffer(ReadBuffer & in_, LZ4::StreamStatistics & statistics_)
+namespace ErrorCodes
+{
+extern const int UNKNOWN_COMPRESSION_METHOD;
+extern const int CANNOT_DECOMPRESS;
+} // namespace ErrorCodes
+
+FasterCompressedReadBuffer::FasterCompressedReadBuffer(ReadBuffer & in_, LZ4::PerformanceStatistics & statistics_)
     : Base(&in_)
     , BufferWithOwnMemory<ReadBuffer>(0)
     , statistics(statistics_)
@@ -48,24 +55,12 @@ void FasterCompressedReadBuffer::decompress(char * to, size_t size_decompressed,
 
     if (method == static_cast<UInt8>(CompressionMethodByte::LZ4))
     {
-        LZ4::decompress(compressed_buffer + COMPRESSED_BLOCK_HEADER_SIZE, to, size_compressed_without_checksum - COMPRESSED_BLOCK_HEADER_SIZE, size_decompressed, statistics);
-
-        if (unlikely(LZ4_decompress_safe(compressed_buffer + COMPRESSED_BLOCK_HEADER_SIZE, to, size_compressed_without_checksum - COMPRESSED_BLOCK_HEADER_SIZE, size_decompressed) < 0))
-            throw Exception("Cannot LZ4_decompress_safe", ErrorCodes::CANNOT_DECOMPRESS);
-    }
-    else if (method == static_cast<UInt8>(CompressionMethodByte::ZSTD))
-    {
-        size_t res = ZSTD_decompress(to, size_decompressed, compressed_buffer + COMPRESSED_BLOCK_HEADER_SIZE, size_compressed_without_checksum - COMPRESSED_BLOCK_HEADER_SIZE);
-
-        if (ZSTD_isError(res))
-            throw Exception("Cannot ZSTD_decompress: " + std::string(ZSTD_getErrorName(res)), ErrorCodes::CANNOT_DECOMPRESS);
-    }
-    else if (method == static_cast<UInt8>(CompressionMethodByte::NONE))
-    {
-        memcpy(to, &compressed_buffer[COMPRESSED_BLOCK_HEADER_SIZE], size_decompressed);
+        auto ok = LZ4::decompress(compressed_buffer + COMPRESSED_BLOCK_HEADER_SIZE, to, size_compressed_without_checksum - COMPRESSED_BLOCK_HEADER_SIZE, size_decompressed, statistics);
+        if unlikely (!ok)
+            throw Exception("Cannot decompress by LZ4_decompress_faster", ErrorCodes::CANNOT_DECOMPRESS);
     }
     else
-        throw Exception("Unknown compression method: " + toString(method), ErrorCodes::UNKNOWN_COMPRESSION_METHOD);
+        throw Exception(ErrorCodes::UNKNOWN_COMPRESSION_METHOD, "{} only supports compression method LZ4, can't tell flag {}", typeid(Self).name(), toString(method));
 }
 
 

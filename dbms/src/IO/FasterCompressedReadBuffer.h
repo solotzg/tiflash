@@ -35,7 +35,8 @@ private:
     void decompress(char * to, size_t size_decompressed, size_t size_compressed_without_checksum);
 
 public:
-    explicit FasterCompressedReadBuffer(ReadBuffer & in_, LZ4::StreamStatistics & statistics_);
+    static std::unique_ptr<Self> genFasterCompressedReadBuffer();
+    explicit FasterCompressedReadBuffer(ReadBuffer & in_, LZ4::PerformanceStatistics & statistics_);
 
     size_t readBig(char * to, size_t n) override;
 
