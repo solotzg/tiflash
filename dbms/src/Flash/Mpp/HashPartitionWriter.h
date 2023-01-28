@@ -60,7 +60,7 @@ private:
     int64_t mem_size_in_blocks{};
     DataTypes expected_types;
     MPPDataPacketVersion data_codec_version;
-    CompressionMethod compression_method{};
+    tipb::CompressionMode compression_mode{};
 };
 
 } // namespace DB

@@ -41,6 +41,45 @@ TrackedMppDataPacketPtr serializePacket(const tipb::SelectResponse & response)
 }
 } // namespace
 
+struct MppCompressionMethodSelector
+{
+    static constexpr int64_t MAX_SENDING_MPP_DATA_SIZE = 0.8 * 1024 * 1024 * 1024; // 0.8 GB
+
+    void add(int64_t dela)
+    {
+        data_size_to_send += dela;
+    }
+    CompressionMethod select(tipb::CompressionMode compression_mode) const
+    {
+        if (data_size_to_send.load(std::memory_order_relaxed) > MAX_SENDING_MPP_DATA_SIZE)
+        {
+            return ToInternalCompressionMethod(compression_mode);
+        }
+        return CompressionMethod::NONE;
+    }
+    static MppCompressionMethodSelector & getInstance()
+    {
+        static MppCompressionMethodSelector instance{};
+        return instance;
+    }
+
+private:
+    std::atomic_int64_t data_size_to_send;
+};
+struct MppSendingDataStatisticHolder
+{
+    uint64_t data_size;
+    explicit MppSendingDataStatisticHolder(uint64_t size)
+        : data_size(size)
+    {
+        MppCompressionMethodSelector::getInstance().add(data_size);
+    }
+    ~MppSendingDataStatisticHolder()
+    {
+        MppCompressionMethodSelector::getInstance().add(-data_size);
+    }
+};
+
 template <typename Tunnel>
 MPPTunnelSetBase<Tunnel>::MPPTunnelSetBase(DAGContext & dag_context, const String & req_id)
     : log(Logger::get(req_id))
@@ -117,8 +156,12 @@ void MPPTunnelSetBase<Tunnel>::broadcastOrPassThroughWrite(Blocks & blocks)
     checkPacketSize(packet_bytes);
     // TODO avoid copy packet for broadcast.
     for (size_t i = 1; i < tunnels.size(); ++i)
+    {
         tunnels[i]->write(tracked_packet->copy());
-    tunnels[0]->write(std::move(tracked_packet));
+    }
+    {
+        tunnels[0]->write(std::move(tracked_packet));
+    }
     {
         // statistic
         size_t data_bytes = 0;
@@ -149,7 +192,10 @@ void MPPTunnelSetBase<Tunnel>::partitionWrite(Blocks & blocks, int16_t partition
 
     auto packet_bytes = tracked_packet->getPacket().ByteSizeLong();
     checkPacketSize(packet_bytes);
-    tunnels[partition_id]->write(std::move(tracked_packet));
+    {
+        MppSendingDataStatisticHolder holder{isLocal(partition_id) ? 0 : packet_bytes};
+        tunnels[partition_id]->write(std::move(tracked_packet));
+    }
     updatePartitionWriterMetrics(packet_bytes, isLocal(partition_id));
 }
 
@@ -159,12 +205,12 @@ void MPPTunnelSetBase<Tunnel>::partitionWrite(
     std::vector<MutableColumns> && part_columns,
     int16_t partition_id,
     MPPDataPacketVersion version,
-    CompressionMethod compression_method)
+    tipb::CompressionMode mode)
 {
     assert(version > MPPDataPacketV0);
 
     bool is_local = isLocal(partition_id);
-    compression_method = is_local ? CompressionMethod::NONE : compression_method;
+    auto compression_method = is_local ? CompressionMethod::NONE : MppCompressionMethodSelector::getInstance().select(mode);
 
     size_t original_size = 0;
     auto tracked_packet = MPPTunnelSetHelper::ToPacket(header, std::move(part_columns), version, compression_method, original_size);
@@ -173,7 +219,10 @@ void MPPTunnelSetBase<Tunnel>::partitionWrite(
 
     auto packet_bytes = tracked_packet->getPacket().ByteSizeLong();
     checkPacketSize(packet_bytes);
-    tunnels[partition_id]->write(std::move(tracked_packet));
+    {
+        MppSendingDataStatisticHolder holder{isLocal(partition_id) ? 0 : packet_bytes};
+        tunnels[partition_id]->write(std::move(tracked_packet));
+    }
     updatePartitionWriterMetrics(compression_method, original_size, packet_bytes, is_local);
 }
 
@@ -186,13 +235,13 @@ void MPPTunnelSetBase<Tunnel>::fineGrainedShuffleWrite(
     size_t num_columns,
     int16_t partition_id,
     MPPDataPacketVersion version,
-    CompressionMethod compression_method)
+    tipb::CompressionMode mode)
 {
     if (version == MPPDataPacketV0)
         return fineGrainedShuffleWrite(header, scattered, bucket_idx, fine_grained_shuffle_stream_count, num_columns, partition_id);
 
     bool is_local = isLocal(partition_id);
-    compression_method = is_local ? CompressionMethod::NONE : compression_method;
+    auto compression_method = is_local ? CompressionMethod::NONE : MppCompressionMethodSelector::getInstance().select(mode);
 
     size_t original_size = 0;
     auto tracked_packet = MPPTunnelSetHelper::ToFineGrainedPacket(
@@ -210,7 +259,10 @@ void MPPTunnelSetBase<Tunnel>::fineGrainedShuffleWrite(
 
     auto packet_bytes = tracked_packet->getPacket().ByteSizeLong();
     checkPacketSize(packet_bytes);
-    tunnels[partition_id]->write(std::move(tracked_packet));
+    {
+        MppSendingDataStatisticHolder holder{isLocal(partition_id) ? 0 : packet_bytes};
+        tunnels[partition_id]->write(std::move(tracked_packet));
+    }
     updatePartitionWriterMetrics(compression_method, original_size, packet_bytes, is_local);
 }
 
@@ -237,7 +289,10 @@ void MPPTunnelSetBase<Tunnel>::fineGrainedShuffleWrite(
 
     auto packet_bytes = tracked_packet->getPacket().ByteSizeLong();
     checkPacketSize(packet_bytes);
-    tunnels[partition_id]->write(std::move(tracked_packet));
+    {
+        MppSendingDataStatisticHolder holder{isLocal(partition_id) ? 0 : packet_bytes};
+        tunnels[partition_id]->write(std::move(tracked_packet));
+    }
     updatePartitionWriterMetrics(packet_bytes, isLocal(partition_id));
 }
 

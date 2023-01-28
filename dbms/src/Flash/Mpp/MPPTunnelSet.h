@@ -38,7 +38,7 @@ public:
     // data codec version V0
     void partitionWrite(Blocks & blocks, int16_t partition_id);
     // data codec version > V0
-    void partitionWrite(const Block & header, std::vector<MutableColumns> && part_columns, int16_t partition_id, MPPDataPacketVersion version, CompressionMethod compression_method);
+    void partitionWrite(const Block & header, std::vector<MutableColumns> && part_columns, int16_t partition_id, MPPDataPacketVersion version, tipb::CompressionMode mode);
     // this is a fine grained shuffle writing.
     // data codec version V0
     void fineGrainedShuffleWrite(
@@ -56,7 +56,7 @@ public:
         size_t num_columns,
         int16_t partition_id,
         MPPDataPacketVersion version,
-        CompressionMethod compression_method);
+        tipb::CompressionMode mode);
     /// this is a execution summary writing.
     /// for both broadcast writing and partition/fine grained shuffle writing, only
     /// return meaningful execution summary for the first tunnel,

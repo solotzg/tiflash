@@ -73,7 +73,7 @@ private:
     // support data compression
     DataTypes expected_types;
     MPPDataPacketVersion data_codec_version;
-    CompressionMethod compression_method{};
+    tipb::CompressionMode compression_mode{};
 };
 
 } // namespace DB

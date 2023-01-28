@@ -40,7 +40,7 @@ HashPartitionWriter<ExchangeWriterPtr>::HashPartitionWriter(
     , partition_col_ids(std::move(partition_col_ids_))
     , collators(std::move(collators_))
     , data_codec_version(data_codec_version_)
-    , compression_method(ToInternalCompressionMethod(compression_mode_))
+    , compression_mode(compression_mode_)
 {
     rows_in_blocks = 0;
     partition_num = writer_->getPartitionNum();
@@ -179,7 +179,7 @@ void HashPartitionWriter<ExchangeWriterPtr>::partitionAndWriteBlocksV1()
 
     for (size_t part_id = 0; part_id < partition_num; ++part_id)
     {
-        writer->partitionWrite(dest_block_header, std::move(dest_columns[part_id]), part_id, data_codec_version, compression_method);
+        writer->partitionWrite(dest_block_header, std::move(dest_columns[part_id]), part_id, data_codec_version, compression_mode);
     }
 
     assert(blocks.empty());

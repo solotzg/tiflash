@@ -44,7 +44,7 @@ FineGrainedShuffleWriter<ExchangeWriterPtr>::FineGrainedShuffleWriter(
     , batch_send_row_limit(fine_grained_shuffle_batch_size * fine_grained_shuffle_stream_count)
     , hash(0)
     , data_codec_version(data_codec_version_)
-    , compression_method(ToInternalCompressionMethod(compression_mode_))
+    , compression_mode(compression_mode_)
 {
     rows_in_blocks = 0;
     partition_num = writer_->getPartitionNum();
@@ -167,7 +167,7 @@ void FineGrainedShuffleWriter<ExchangeWriterPtr>::batchWriteFineGrainedShuffleIm
                 num_columns,
                 part_id,
                 data_codec_version,
-                compression_method);
+                compression_mode);
         }
         rows_in_blocks = 0;
     }
