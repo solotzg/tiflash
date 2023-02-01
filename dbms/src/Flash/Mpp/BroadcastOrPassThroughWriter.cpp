@@ -13,9 +13,11 @@
 // limitations under the License.
 
 #include <Common/TiFlashException.h>
+#include <Common/TiFlashMetrics.h>
 #include <Flash/Coprocessor/CHBlockChunkCodec.h>
 #include <Flash/Mpp/BroadcastOrPassThroughWriter.h>
 #include <Flash/Mpp/MPPTunnelSet.h>
+#include <Flash/Mpp/MppVersion.h>
 
 namespace DB
 {
@@ -63,7 +65,7 @@ void BroadcastOrPassThroughWriter<ExchangeWriterPtr>::encodeThenWriteBlocks()
     if (unlikely(blocks.empty()))
         return;
 
-    auto tracked_packet = std::make_shared<TrackedMppDataPacket>();
+    auto tracked_packet = std::make_shared<TrackedMppDataPacket>(MPPDataPacketV0);
     while (!blocks.empty())
     {
         const auto & block = blocks.back();
@@ -74,7 +76,22 @@ void BroadcastOrPassThroughWriter<ExchangeWriterPtr>::encodeThenWriteBlocks()
     }
     assert(blocks.empty());
     rows_in_blocks = 0;
+    auto packet_bytes = tracked_packet->getPacket().ByteSizeLong();
     writer->broadcastOrPassThroughWrite(std::move(tracked_packet));
+
+    {
+        auto tunnel_cnt = writer->getPartitionNum();
+        size_t local_tunnel_cnt = 0;
+        for (size_t i = 0; i < tunnel_cnt; ++i)
+        {
+            local_tunnel_cnt += writer->isLocal(i);
+        }
+        auto original = packet_bytes * tunnel_cnt;
+        auto local = packet_bytes * local_tunnel_cnt;
+        GET_METRIC(tiflash_exchange_data_bytes, type_broadcast_passthrough_original).Increment(original);
+        GET_METRIC(tiflash_exchange_data_bytes, type_broadcast_passthrough_none_compression_local).Increment(local);
+        GET_METRIC(tiflash_exchange_data_bytes, type_broadcast_passthrough_none_compression_remote).Increment(original - local);
+    }
 }
 
 template class BroadcastOrPassThroughWriter<MPPTunnelSetPtr>;

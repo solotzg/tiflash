@@ -142,12 +142,14 @@ void scatterColumns(const Block & input_block,
     }
 }
 
-DB::TrackedMppDataPacketPtrs createPackets(size_t partition_num)
+DB::TrackedMppDataPacketPtrs createPackets(size_t partition_num, uint64_t version)
 {
     DB::TrackedMppDataPacketPtrs tracked_packets;
     tracked_packets.reserve(partition_num);
     for (size_t i = 0; i < partition_num; ++i)
-        tracked_packets.emplace_back(std::make_shared<TrackedMppDataPacket>());
+    {
+        tracked_packets.emplace_back(std::make_shared<TrackedMppDataPacket>(version));
+    }
     return tracked_packets;
 }
 
