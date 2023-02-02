@@ -147,7 +147,6 @@ private:
         const LoggerPtr & log);
 
     void waitAllConnectionDone();
-    void waitLocalConnectionDone(std::unique_lock<std::mutex> & lock);
 
     void finishAllMsgChannels();
     void cancelAllMsgChannels();
@@ -160,11 +159,6 @@ private:
 
 private:
     void prepareMsgChannels();
-    void addLocalConnectionNum();
-    void addSyncConnectionNum();
-    void addAsyncConnectionNum(Int32 conn_num);
-
-    void connectionLocalDone();
 
     bool isReceiverForTiFlashStorage()
     {
@@ -190,7 +184,6 @@ private:
     std::condition_variable cv;
     /// should lock `mu` when visit these members
     Int32 live_connections;
-    Int32 live_local_connections;
     ExchangeReceiverState state;
     String err_msg;
 

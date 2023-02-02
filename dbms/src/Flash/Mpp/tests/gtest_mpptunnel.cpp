@@ -148,7 +148,6 @@ class MockExchangeReceiver
 public:
     explicit MockExchangeReceiver(Int32 conn_num)
         : live_connections(conn_num)
-        , live_local_connections(0)
         , data_size_in_queue(0)
         , log(Logger::get())
     {
@@ -170,18 +169,6 @@ public:
             msg_channels[0]->finish();
     }
 
-    void addLocalConnectionNum()
-    {
-        std::lock_guard<std::mutex> lock(mu);
-        ++live_local_connections;
-    }
-
-    void connectionLocalDone()
-    {
-        std::lock_guard<std::mutex> lock(mu);
-        --live_local_connections;
-    }
-
     void connectLocalTunnel(std::vector<MPPTunnelPtr> & tunnels)
     {
         if (static_cast<Int32>(tunnels.size()) != live_connections)
@@ -194,10 +181,6 @@ public:
                 [this](bool meet_error, const String & err_msg) {
                     this->connectionDone(meet_error, err_msg);
                 },
-                [this]() {
-                    this->connectionLocalDone();
-                },
-                []() {},
                 ReceiverChannelWriter(&msg_channels, "", log, &data_size_in_queue, ReceiverMode::Local));
             tunnel->connectLocal(0, local_request_handler, false);
         }
@@ -231,7 +214,6 @@ private:
     std::mutex mu;
     std::condition_variable cv;
     Int32 live_connections;
-    Int32 live_local_connections;
     std::vector<MsgChannelPtr> msg_channels;
     String err_msg;
     std::vector<std::shared_ptr<ReceivedMessage>> received_msgs;
@@ -281,10 +263,6 @@ public:
     static void setTunnelFinished(MPPTunnelPtr tunnel)
     {
         tunnel->status = MPPTunnel::TunnelStatus::Finished;
-        if (tunnel->local_tunnel_sender)
-            tunnel->local_tunnel_sender->is_done.store(true);
-        else if (tunnel->local_tunnel_fine_grained_sender)
-            tunnel->local_tunnel_fine_grained_sender->is_done.store(true);
     }
 
     static bool getTunnelConnectedFlag(MPPTunnelPtr tunnel)
@@ -646,14 +624,12 @@ CATCH
 TEST_F(TestMPPTunnel, LocalConnectWhenFinished)
 try
 {
-    auto [receiver, tunnels] = prepareLocal(1);
+    auto [_, tunnels] = prepareLocal(1);
     setTunnelFinished(tunnels[0]);
 
     LocalRequestHandler local_req_handler(
         nullptr,
         [](bool, const String &) {},
-        []() {},
-        []() {},
         ReceiverChannelWriter(nullptr, "", Logger::get(), nullptr, ReceiverMode::Local));
     tunnels[0]->connectLocal(0, local_req_handler, false);
     GTEST_FAIL();
@@ -666,13 +642,11 @@ catch (Exception & e)
 TEST_F(TestMPPTunnel, LocalConnectWhenConnected)
 try
 {
-    auto [receiver, tunnels] = prepareLocal(1);
+    auto [_, tunnels] = prepareLocal(1);
     GTEST_ASSERT_EQ(getTunnelConnectedFlag(tunnels[0]), true);
     LocalRequestHandler local_req_handler(
         nullptr,
         [](bool, const String &) {},
-        []() {},
-        []() {},
         ReceiverChannelWriter(nullptr, "", Logger::get(), nullptr, ReceiverMode::Local));
     tunnels[0]->connectLocal(0, local_req_handler, false);
     GTEST_FAIL();
@@ -685,7 +659,7 @@ catch (Exception & e)
 TEST_F(TestMPPTunnel, LocalCloseBeforeConnect)
 try
 {
-    auto [receiver, tunnels] = prepareLocal(1);
+    auto [_, tunnels] = prepareLocal(1);
     tunnels[0]->close("Canceled", true);
     GTEST_ASSERT_EQ(getTunnelFinishedFlag(tunnels[0]), true);
     GTEST_ASSERT_EQ(getTunnelConnectedFlag(tunnels[0]), false);
@@ -695,7 +669,7 @@ CATCH
 TEST_F(TestMPPTunnel, LocalCloseAfterClose)
 try
 {
-    auto [receiver, tunnels] = prepareLocal(1);
+    auto [_, tunnels] = prepareLocal(1);
     tunnels[0]->close("Canceled", true);
     GTEST_ASSERT_EQ(getTunnelFinishedFlag(tunnels[0]), true);
     tunnels[0]->close("Canceled", true);
@@ -732,7 +706,7 @@ catch (Exception & e)
 TEST_F(TestMPPTunnel, LocalWriteError)
 try
 {
-    auto [receiver, tunnels] = prepareLocal(1);
+    auto [_, tunnels] = prepareLocal(1);
     GTEST_ASSERT_EQ(getTunnelConnectedFlag(tunnels[0]), true);
     auto packet = newDataPacket("First");
     packet->error_message = "err";
@@ -761,12 +735,10 @@ catch (Exception & e)
 
 TEST_F(TestMPPTunnel, LocalWriteAfterFinished)
 {
-    MockExchangeReceiverPtr receiver_ptr;
     MPPTunnelPtr tunnel = nullptr;
     try
     {
-        auto [receiver, tunnels] = prepareLocal(1);
-        receiver_ptr = receiver;
+        auto [_, tunnels] = prepareLocal(1);
         tunnel = tunnels[0];
         GTEST_ASSERT_EQ(getTunnelConnectedFlag(tunnel), true);
         tunnel->close("", false);
