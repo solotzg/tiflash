@@ -385,7 +385,7 @@ grpc::Status FlashService::EstablishMPPConnection(grpc::ServerContext * grpc_con
     {
         Stopwatch stopwatch;
         SyncPacketWriter writer(sync_writer);
-        tunnel->connectSync(&writer);
+        tunnel->connect(&writer);
         tunnel->waitForFinish();
         LOG_INFO(tunnel->getLogger(), "connection for {} cost {} ms.", tunnel->id(), stopwatch.elapsedMilliseconds());
     }
