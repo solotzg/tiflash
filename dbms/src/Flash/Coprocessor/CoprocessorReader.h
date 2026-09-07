@@ -178,7 +178,6 @@ public:
         UInt64 cop_timeout,
         const pingcap::kv::LabelFilter & tiflash_label_filter_,
         const String & source_identifier,
-        const String & store_zone_label = "",
         UInt64 prefer_store_id = 0)
         : schema(schema_)
         , has_enforce_encode_type(has_enforce_encode_type_)
@@ -192,7 +191,7 @@ public:
               &Poco::Logger::get(fmt::format("{} pingcap/coprocessor", source_identifier)),
               cop_timeout,
               tiflash_label_filter_,
-              store_zone_label,
+              "",
               prefer_store_id)
     {}
 
