@@ -14,8 +14,11 @@
 
 #include <Common/TiFlashException.h>
 #include <Flash/Coprocessor/ChunkCodec.h>
+#include <Flash/Coprocessor/DAGCodec.h>
+#include <Flash/Coprocessor/DAGExpressionAnalyzer.h>
 #include <Flash/Coprocessor/DAGPipeline.h>
 #include <Flash/Coprocessor/DAGStorageInterpreter.h>
+#include <Flash/Coprocessor/DAGUtils.h>
 #include <Flash/Coprocessor/GenSchemaAndColumn.h>
 #include <Flash/Coprocessor/InterpreterUtils.h>
 #include <Flash/Coprocessor/StorageDisaggregatedInterpreter.h>
@@ -23,14 +26,112 @@
 #include <Flash/Planner/FinalizeHelper.h>
 #include <Flash/Planner/PhysicalPlanHelper.h>
 #include <Flash/Planner/Plans/PhysicalTableScan.h>
+#include <DataStreams/GeneratedColumnPlaceholderBlockInputStream.h>
 #include <Interpreters/Context.h>
 #include <Interpreters/SharedContexts/Disagg.h>
 #include <Operators/ExpressionTransformOp.h>
+
+#include <string_view>
 
 namespace DB
 {
 namespace
 {
+constexpr std::string_view fts_boolean_query_marker = "__tiflash_fts_boolean_query__:";
+
+tipb::Expr buildFTSExpression(const TiDBTableScan & table_scan, Int32 result_type)
+{
+    const auto & query_info = table_scan.getFTSQueryInfo();
+    const auto query_func = query_info.has_query_func() ? query_info.query_func() : tipb::ScalarFuncSig::FTSMatchWord;
+    if (query_func == tipb::ScalarFuncSig::FTSMatchWord)
+        RUNTIME_CHECK_MSG(query_info.columns_size() == 1, "FTS_MATCH_WORD currently supports exactly one column");
+    else
+        RUNTIME_CHECK_MSG(
+            query_func == tipb::ScalarFuncSig::FTSMatchExpression && query_info.columns_size() > 0,
+            "Unsupported full-text query function or empty MATCH column list");
+
+    tipb::Expr expression;
+    expression.set_tp(tipb::ExprType::ScalarFunc);
+    expression.set_sig(query_func);
+    expression.mutable_field_type()->set_tp(result_type);
+    expression.mutable_field_type()->set_flag(TiDB::ColumnFlagNotNull);
+    *expression.add_children() = constructStringLiteralTiExpr(query_info.query_text());
+
+    for (const auto & query_column : query_info.columns())
+    {
+        const auto column_id = query_column.column_id();
+        const TiDB::ColumnInfo * column_info = nullptr;
+        Int64 column_index = -1;
+        for (size_t i = 0; i < table_scan.getColumns().size(); ++i)
+        {
+            const auto & column = table_scan.getColumns()[i];
+            if (column.id == column_id)
+            {
+                column_info = &column;
+                column_index = i;
+                break;
+            }
+        }
+        RUNTIME_CHECK_MSG(column_info != nullptr, "Full-text column is not present in table scan columns");
+
+        tipb::Expr column_ref;
+        column_ref.set_tp(tipb::ExprType::ColumnRef);
+        WriteBufferFromOwnString ss;
+        encodeDAGInt64(column_index, ss);
+        column_ref.set_val(ss.releaseStr());
+        *column_ref.mutable_field_type() = TiDB::columnInfoToFieldType(*column_info);
+        *expression.add_children() = std::move(column_ref);
+    }
+
+    if (query_func == tipb::ScalarFuncSig::FTSMatchExpression && query_info.has_boolean_query())
+    {
+        *expression.add_children()
+            = constructStringLiteralTiExpr(String(fts_boolean_query_marker) + query_info.boolean_query().SerializeAsString());
+    }
+    return expression;
+}
+
+tipb::Expr buildFTSFilter(const TiDBTableScan & table_scan)
+{
+    return buildFTSExpression(table_scan, TiDB::TypeDouble);
+}
+
+String getFTSScorePlaceholderName(const TiDBTableScan & table_scan)
+{
+    for (size_t i = 0; i < table_scan.getColumns().size(); ++i)
+    {
+        if (isTiDBFTSScoreColumn(table_scan.getColumns()[i].id))
+            return GeneratedColumnPlaceholderBlockInputStream::getColumnName(i);
+    }
+    throw TiFlashException("FTS score column is missing from table scan", Errors::Coprocessor::BadRequest);
+}
+
+ExpressionActionsPtr buildFTSScoreActions(
+    const Block & input_header,
+    const TiDBTableScan & table_scan,
+    const Context & context)
+{
+    auto actions = std::make_shared<ExpressionActions>(input_header.getColumnsWithTypeAndName());
+    DAGExpressionAnalyzer analyzer(input_header, context);
+    const auto score_expr = buildFTSExpression(table_scan, TiDB::TypeFloat);
+    const auto score_expr_name = analyzer.getActions(score_expr, actions);
+    const auto score_column_name = getFTSScorePlaceholderName(table_scan);
+
+    RUNTIME_CHECK_MSG(
+        actions->getSampleBlock().has(score_column_name),
+        "FTS score placeholder is missing from table scan input");
+    actions->add(ExpressionAction::removeColumn(score_column_name));
+    actions->add(ExpressionAction::copyColumn(score_expr_name, score_column_name));
+
+    NamesWithAliases project_columns;
+    project_columns.reserve(input_header.columns());
+    for (const auto & column : input_header)
+        project_columns.emplace_back(column.name, column.name);
+    actions->add(ExpressionAction::project(project_columns));
+    actions->finalize(input_header.getNames());
+    return actions;
+}
+
 NamesWithAliases buildTableScanProjectionCols(
     Int64 logical_table_id,
     const NamesAndTypes & schema,
@@ -82,7 +183,14 @@ PhysicalTableScan::PhysicalTableScan(
     : PhysicalLeaf(executor_id_, PlanType::TableScan, schema_, FineGrainedShuffle{}, req_id)
     , tidb_table_scan(tidb_table_scan_)
     , sample_block(sample_block_)
-{}
+{
+    if (tidb_table_scan.getFTSQueryInfo().columns_size() > 0)
+    {
+        google::protobuf::RepeatedPtrField<tipb::Expr> conditions;
+        *conditions.Add() = buildFTSFilter(tidb_table_scan);
+        filter_conditions = FilterConditions(executor_id_, conditions);
+    }
+}
 
 PhysicalPlanNodePtr PhysicalTableScan::build(
     const String & executor_id,
@@ -113,7 +221,7 @@ void PhysicalTableScan::buildBlockInputStreamImpl(DAGPipeline & pipeline, Contex
         DAGStorageInterpreter storage_interpreter(context, tidb_table_scan, filter_conditions, max_streams);
         storage_interpreter.execute(pipeline);
     }
-    buildProjection(pipeline);
+    buildProjection(pipeline, context);
 }
 
 void PhysicalTableScan::buildPipeline(
@@ -136,7 +244,7 @@ void PhysicalTableScan::buildPipeline(
         DAGStorageInterpreter storage_interpreter(context, tidb_table_scan, filter_conditions, context.getMaxStreams());
         storage_interpreter.execute(exec_context, pipeline_exec_builder);
     }
-    buildProjection(exec_context, pipeline_exec_builder);
+    buildProjection(exec_context, pipeline_exec_builder, context);
 
     PhysicalPlanNode::buildPipeline(builder, context, exec_context);
 }
@@ -151,8 +259,17 @@ void PhysicalTableScan::buildPipelineExecGroupImpl(
     group_builder = std::move(pipeline_exec_builder);
 }
 
-void PhysicalTableScan::buildProjection(DAGPipeline & pipeline)
+void PhysicalTableScan::buildProjection(DAGPipeline & pipeline, Context & context)
 {
+    if (tidb_table_scan.getFTSQueryInfo().query_type() == tipb::FTSQueryType::FTSQueryTypeWithScore)
+    {
+        RUNTIME_CHECK_MSG(
+            !pipeline.streams.empty(),
+            "FTS score cannot be materialized without a table scan stream");
+        auto score_actions = buildFTSScoreActions(pipeline.firstStream()->getHeader(), tidb_table_scan, context);
+        executeExpression(pipeline, score_actions, log, "full-text score");
+    }
+
     const auto & schema_project_cols = buildTableScanProjectionCols(
         tidb_table_scan.getLogicalTableID(),
         schema,
@@ -165,8 +282,15 @@ void PhysicalTableScan::buildProjection(DAGPipeline & pipeline)
 
 void PhysicalTableScan::buildProjection(
     PipelineExecutorContext & exec_context,
-    PipelineExecGroupBuilder & group_builder)
+    PipelineExecGroupBuilder & group_builder,
+    Context & context)
 {
+    if (tidb_table_scan.getFTSQueryInfo().query_type() == tipb::FTSQueryType::FTSQueryTypeWithScore)
+    {
+        auto score_actions = buildFTSScoreActions(group_builder.getCurrentHeader(), tidb_table_scan, context);
+        executeExpression(exec_context, group_builder, score_actions, log);
+    }
+
     auto header = group_builder.getCurrentHeader();
     const auto & schema_project_cols
         = buildTableScanProjectionCols(tidb_table_scan.getLogicalTableID(), schema, header);
@@ -190,14 +314,11 @@ const Block & PhysicalTableScan::getSampleBlock() const
 
 bool PhysicalTableScan::setFilterConditions(const String & filter_executor_id, const tipb::Selection & selection)
 {
-    /// Since there is at most one selection on the table scan, setFilterConditions() will only be called at most once.
-    /// So in this case hasFilterConditions() is always false.
-    if (unlikely(hasFilterConditions()))
-    {
-        return false;
-    }
-
-    filter_conditions = FilterConditions::filterConditionsFrom(filter_executor_id, selection);
+    if (!hasFilterConditions())
+        filter_conditions = FilterConditions::filterConditionsFrom(filter_executor_id, selection);
+    else
+        for (const auto & condition : selection.conditions())
+            *filter_conditions.conditions.Add() = condition;
     return true;
 }
 
