@@ -1,11 +1,30 @@
 # TiFlash MATCH AGAINST pushdown
 
+## Implementation status
+
+This document describes the implementation currently on the `match_against`
+branch. The verified TiFlash commit is `55c2b6810c`:
+`fts: support nullable MATCH columns in TiFlash`.
+
+The delivery target is the release-8.5 family and the supported product
+surface is:
+
+```sql
+MATCH(col) AGAINST('+tidb -mysql' IN BOOLEAN MODE)
+```
+
+The implementation is a snapshot-local scan evaluator. It does not require a
+FULLTEXT index and it is not an inverted-index implementation. TiFlash is
+used when a table has an available replica; without a TiFlash replica, TiDB
+uses its local evaluator through the normal TiKV read path.
+
 ## Introduction
 
 This document describes the TiFlash-side implementation for evaluating TiDB
 `MATCH ... AGAINST` and `FTS_MATCH_WORD` expressions on the read snapshot.
 The implementation is intentionally limited to the existing release-8.5
-TiDB-to-TiFlash protocol. TiKV, TICI, and TiDB-side changes are out of scope.
+TiDB-to-TiFlash protocol. TiKV, TICI, and TiDB-side changes are out of scope
+for this TiFlash change.
 
 ## Motivation or Background
 
@@ -20,24 +39,37 @@ index.
 
 ### Protocol and planner path
 
-The `contrib/tipb` submodule is advanced to the upstream protocol revision that
-contains `ScalarFuncSig_FTSMatchWord`, `ScalarFuncSig_FTSMatchExpression`,
-`FTSQueryInfo`, and `used_columnar_indexes`.
+The `contrib/tipb` submodule is pinned to the FTS protocol commit
+`0a9c803d4e` on the `release-8.5-match-against` line. The protocol carries
+`ScalarFuncSig_FTSMatchWord`, `ScalarFuncSig_FTSMatchExpression`,
+`FTSQueryInfo`, `FTSBooleanQuery`, and `used_columnar_indexes`.
 
 TiFlash maps the two scalar signatures as follows:
 
 | tipb signature | TiFlash function | semantics |
 | --- | --- | --- |
-| `FTSMatchWord` | `fts_match_word` | Boolean-mode filter evaluator |
+| `FTSMatchWord` | `fts_match_word` | Legacy one-column full-text evaluator |
 | `FTSMatchExpression` | `fts_match_expression` | Boolean-aware evaluator over MATCH columns |
 
-For an index-style `FTSQueryInfo`, `PhysicalTableScan` reconstructs a
-`fts_match_word(query, column)` filter and merges it with ordinary Selection
-conditions. For `FTSQueryTypeWithScore`, it evaluates the same expression after
-the scan and replaces the `_FTS_SCORE` generated-column placeholder with the
-resulting `FLOAT` column. This keeps the existing table-scan schema and lets
-Projection, Filter, and TopN consume the same score column. The expression
-pipeline runs on the same read snapshot as the row data.
+For the #70484/#70485 boolean predicate, TiDB serializes a `FTSQueryInfo`
+into the table scan. `TiDBTableScan` extracts it and `PhysicalTableScan`
+builds an `fts_match_expression` filter containing:
+
+1. the original query text;
+2. MATCH column references and their TiDB field types;
+3. the encoded `FTSBooleanQuery` containing required and prohibited terms.
+
+The filter is attached to the TiFlash table-scan pipeline rather than added
+as a root TiDB Selection. The expression carries the first MATCH column's
+protocol collation to the TiFlash function. The score path still supports the
+existing `_FTS_SCORE` placeholder, but score semantics are outside the
+boolean-mode delivery target.
+
+The expression pipeline runs on the same read snapshot as the row data. The
+FTS query is evaluated by the scan executor after rows are read; it is not
+used by the DeltaMerge rough-set index. Consequently, current logs may report
+`FTSMatchExpression is not supported` for rough-set pruning while the MATCH
+predicate itself is still evaluated successfully by the TiFlash scan.
 
 ### Analyzer and matcher
 
@@ -45,7 +77,7 @@ The evaluator implements the STANDARD_V1-compatible Boolean matching subset
 used by #70484/#70485:
 
 - Unicode letter/number token runs with `_` preserved;
-- Unicode lower-casing;
+- Unicode lower-casing when no protocol collator is available;
 - default token length range 3..84;
 - the default InnoDB stopword set;
 - Boolean `+` required terms, `-` prohibited terms, quoted phrases, and a
@@ -55,14 +87,38 @@ used by #70484/#70485:
 - NULL MATCH columns contribute no tokens and do not nullify the whole row.
 
 The predicate path consumes the numeric result as a Boolean value (`0` means
-no match, a positive value means match). Queries containing Boolean syntax use
-the Boolean matcher; plain queries retain the existing token-overlap behavior
-for compatibility with the current scalar signature. The implementation
-still returns a deterministic positive term-frequency value for the existing
-`_FTS_SCORE` placeholder path, but that score is not part of the
-#70484/#70485 acceptance scope and is not claimed to be MySQL/InnoDB
-relevance. Nullable query arguments preserve NULL; nullable MATCH columns
-contribute no tokens.
+no match, a positive value means match). Queries containing Boolean syntax
+use the Boolean matcher; plain queries retain the existing token-overlap
+behavior for compatibility with the current scalar signature. The
+implementation still returns a deterministic positive term-frequency value
+for the existing `_FTS_SCORE` placeholder path, but that score is not part of
+the #70484/#70485 acceptance scope and is not claimed to be MySQL/InnoDB
+relevance. Nullable query arguments preserve NULL.
+
+### Collation handling
+
+When a protocol collation is available, TiFlash preserves the source spelling
+of tokens and compares terms through the TiDB collator. This makes matching
+case and accent behavior follow the column collation. Prefix matching reuses
+the same collator-aware comparison path.
+
+The local TiDB fallback is a separate implementation. The current fallback
+still lower-cases tokens and therefore does not fully preserve
+`utf8mb4_bin` case sensitivity. This is a TiDB-side consistency limitation;
+it is not changed by the TiFlash implementation.
+
+### Nullable columns
+
+`FunctionsFullText.cpp` handles nullable string columns by treating a NULL
+MATCH column as an empty document. The table-scan expression must nevertheless
+declare a nullable result type: otherwise the DAG analyzer inserts a cast from
+`Nullable(Float64)` to `Float64` and a NULL row fails with
+`Cannot convert NULL value to non-Nullable type`.
+
+`PhysicalTableScan` now clears `ColumnFlagNotNull` when any MATCH column is
+nullable. This keeps the planner metadata aligned with the function return
+type and lets a nullable column be evaluated as a normal no-match row in a
+WHERE predicate.
 
 ### Consistency boundary
 
@@ -79,7 +135,66 @@ provide corpus-wide IDF normalization.
 
 `dbms/src/Functions/tests/gtest_fulltext.cpp` covers required/prohibited terms,
 phrases with stopword gaps, prefixes, word boundaries, nullable input, NULL
-MATCH columns, and unsupported score modifiers.
+MATCH columns, collation behavior, and unsupported score modifiers.
+
+### Local E2E validation
+
+The local E2E test used TiUP playground v8.5.8 with locally built TiDB and
+TiFlash binaries. The TiFlash replica was waited to `AVAILABLE=1` and
+`PROGRESS=1` before querying.
+
+The main query:
+
+```sql
+SELECT id, body
+FROM articles
+WHERE MATCH(body) AGAINST('+tidb -mysql' IN BOOLEAN MODE)
+ORDER BY id;
+```
+
+returned rows `2`, `4`, and `6`. Its plan was:
+
+```text
+TableReader
+└─ExchangeSender  mpp[tiflash]
+  └─TableFullScan   mpp[tiflash]
+```
+
+There was no root `Selection(match_against(...))`. `EXPLAIN ANALYZE` showed
+three actual output rows from the TiFlash task.
+
+The currently supported TiDB collations were tested on TiFlash:
+
+- `ascii_bin`
+- `latin1_bin`
+- `utf8_bin`
+- `utf8_general_ci`
+- `utf8_unicode_ci`
+- `utf8mb4_bin`
+- `utf8mb4_general_ci`
+- `utf8mb4_unicode_ci`
+- `utf8mb4_0900_bin`
+- `utf8mb4_0900_ai_ci`
+
+The matrix covered exact terms, `*` prefixes, case behavior, and
+`cafe`/`café` accent behavior. Binary collations matched only the exact case
+and spelling; CI/AI collations matched the expected case or accent variants.
+
+The nullable regression test used a `utf8mb4_bin NULL` column containing
+`quick runner`, `NULL`, and `QUICK runner`. The query returned only
+`quick runner`, used `mpp[tiflash]`, and no longer raised the NULL conversion
+error.
+
+The no-replica test returned successfully through:
+
+```text
+Selection
+└─TableReader
+  └─TableFullScan  cop[tikv]
+```
+
+This confirms the TiDB fallback path remains available when TiFlash cannot be
+used.
 
 ### Compatibility Tests
 
@@ -101,6 +216,12 @@ sysvars, custom stopword lists, NGRAM_V1, and non-default `AGAINST` modifiers
 are not represented in the current wire contract and must not be treated as
 supported by this phase.
 
+The scan evaluator currently does not perform inverted-index lookup or
+rough-set pruning for FTS. Large tables may therefore scan many rows even
+when the final MATCH result is small. Chinese/CJK tokenization is also not
+claimed by this phase; the tested STANDARD_V1 sample produced no match for a
+Chinese term on both TiFlash and the TiDB fallback.
+
 ## Investigation & Alternatives
 
 An asynchronous external index was rejected because it cannot provide the
@@ -108,8 +229,10 @@ required snapshot consistency. A native DeltaMerge full-text index remains a
 long-term performance design, but it requires a larger write-path, snapshot,
 and index-reader change set.
 
-## Unresolved Questions
+## Remaining work
 
-If exact corpus-wide ranking is required, a future phase must define a
-TiDB-compatible relevance-score contract and add a native DeltaMerge full-text
+Before product release, the paired TiDB branch and TiFlash branch still need
+CI coverage, release-8.5 build verification, and code review. If exact
+corpus-wide ranking or index-level performance is required, a future phase
+must define a relevance-score contract and add a native DeltaMerge full-text
 index.
