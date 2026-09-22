@@ -14,6 +14,7 @@
 
 #include <TestUtils/FunctionTestUtils.h>
 #include <TestUtils/TiFlashTestBasic.h>
+#include <TiDB/Collation/Collator.h>
 #include <gtest/gtest.h>
 #include <tipb/executor.pb.h>
 
@@ -150,6 +151,34 @@ try
             "fts_match_expression",
             {createConstColumn<String>(3, "quick fox"),
              createColumn<String>({"quick brown", "quick fox fox", "slow turtle"})}));
+}
+CATCH
+
+TEST_F(TestFullText, MatchExpressionCollation)
+try
+{
+    const auto ci_collator = TiDB::ITiDBCollator::getCollator(TiDB::ITiDBCollator::UTF8MB4_GENERAL_CI);
+    ASSERT_COLUMN_EQ(
+        createColumn<Float64>({1, 1}),
+        executeFunction(
+            "fts_match_expression",
+            {createConstColumn<String>(2, "+quick"), createColumn<String>({"QUICK runner", "quick runner"})},
+            ci_collator));
+
+    const auto binary_collator = TiDB::ITiDBCollator::getCollator(TiDB::ITiDBCollator::UTF8MB4_BIN);
+    ASSERT_COLUMN_EQ(
+        createColumn<Float64>({0, 1}),
+        executeFunction(
+            "fts_match_expression",
+            {createConstColumn<String>(2, "+quick"), createColumn<String>({"QUICK runner", "quick runner"})},
+            binary_collator));
+
+    ASSERT_COLUMN_EQ(
+        createColumn<Float64>({1, 0}),
+        executeFunction(
+            "fts_match_expression",
+            {createConstColumn<String>(2, "+run*"), createColumn<String>({"RUNNER", "walk"})},
+            ci_collator));
 }
 CATCH
 

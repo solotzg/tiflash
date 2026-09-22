@@ -57,6 +57,8 @@ tipb::Expr buildFTSExpression(const TiDBTableScan & table_scan, Int32 result_typ
     expression.mutable_field_type()->set_flag(TiDB::ColumnFlagNotNull);
     *expression.add_children() = constructStringLiteralTiExpr(query_info.query_text());
 
+    bool fts_collation_initialized = false;
+    bool fts_result_nullable = false;
     for (const auto & query_column : query_info.columns())
     {
         const auto column_id = query_column.column_id();
@@ -80,8 +82,25 @@ tipb::Expr buildFTSExpression(const TiDBTableScan & table_scan, Int32 result_typ
         encodeDAGInt64(column_index, ss);
         column_ref.set_val(ss.releaseStr());
         *column_ref.mutable_field_type() = TiDB::columnInfoToFieldType(*column_info);
+        fts_result_nullable = fts_result_nullable || !column_info->hasNotNullFlag();
+        // FTS returns a numeric score, but its string matching semantics are
+        // determined by the MATCH column collation. Carry the first column's
+        // protocol collation on the scalar expression so the DAG analyzer
+        // passes the same collator to fts_match_expression as it does for
+        // LIKE and comparison functions.
+        if (!fts_collation_initialized && column_ref.field_type().collate() != 0)
+        {
+            expression.mutable_field_type()->set_collate(column_ref.field_type().collate());
+            fts_collation_initialized = true;
+        }
         *expression.add_children() = std::move(column_ref);
     }
+
+    // MATCH returns NULL when any input column is NULL. Keep the result type
+    // nullable so the analyzer does not insert a cast from Nullable(Float64)
+    // to Float64, which would fail at runtime for a NULL row.
+    if (fts_result_nullable)
+        expression.mutable_field_type()->set_flag(0);
 
     if (query_func == tipb::ScalarFuncSig::FTSMatchExpression && query_info.has_boolean_query())
     {

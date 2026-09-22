@@ -27,6 +27,7 @@
 #include <Functions/FunctionsFullText.h>
 #include <Poco/Unicode.h>
 #include <Poco/UTF8String.h>
+#include <TiDB/Collation/Collator.h>
 #include <tipb/executor.pb.h>
 
 #include <algorithm>
@@ -89,7 +90,7 @@ std::pair<UInt32, size_t> decodeCodePoint(std::string_view text, size_t offset)
     return {decoded.first, decoded.second};
 }
 
-std::vector<FullTextToken> tokenizeText(std::string_view text)
+std::vector<FullTextToken> tokenizeText(std::string_view text, const TiDB::TiDBCollatorPtr & collator = nullptr)
 {
     std::vector<FullTextToken> result;
     size_t position = 0;
@@ -112,10 +113,13 @@ std::vector<FullTextToken> tokenizeText(std::string_view text)
             i += length;
         }
 
-        // The TiDB analyzer lower-cases after tokenization. Poco uses the
-        // same Unicode tables for the C++ implementation, while also
-        // preserving the ASCII fast path used by the old evaluator.
-        token = Poco::UTF8::toLower(token);
+        // If a collation is present, retain the source spelling and let the
+        // collator decide case and accent equivalence during matching. This
+        // is important for binary collations, where lower-casing would make
+        // a case-sensitive MATCH unexpectedly case-insensitive. Keep the
+        // legacy lower-case behavior for callers without collation metadata.
+        if (!collator)
+            token = Poco::UTF8::toLower(token);
         result.push_back({std::move(token), position++});
     }
     return result;
@@ -127,13 +131,15 @@ bool isDefaultStopword(const String & token)
         "a",    "about", "an",   "are",  "as",   "at",   "be",   "by",   "com", "de", "en", "for",
         "from", "how",   "i",    "in",    "is",    "it",   "la",   "of",   "on",   "or",   "that", "the",
         "this", "to",    "was",  "what",  "when",  "where", "who",  "will", "with", "und", "www"};
-    return stopwords.contains(token);
+    // Stopwords are stored in canonical lower-case form. Keep their existing
+    // case-insensitive behavior independently from document matching.
+    return stopwords.contains(Poco::UTF8::toLower(token));
 }
 
-std::vector<FullTextToken> analyzeText(std::string_view text)
+std::vector<FullTextToken> analyzeText(std::string_view text, const TiDB::TiDBCollatorPtr & collator = nullptr)
 {
     std::vector<FullTextToken> result;
-    for (auto & token : tokenizeText(text))
+    for (auto & token : tokenizeText(text, collator))
     {
         const auto code_points = UTF8::countCodePoints(
             reinterpret_cast<const UInt8 *>(token.text.data()),
@@ -145,12 +151,43 @@ std::vector<FullTextToken> analyzeText(std::string_view text)
     return result;
 }
 
+bool textEquals(std::string_view lhs, std::string_view rhs, const TiDB::TiDBCollatorPtr & collator)
+{
+    if (!collator)
+        return lhs == rhs;
+    return collator->compare(lhs.data(), lhs.size(), rhs.data(), rhs.size()) == 0;
+}
+
+bool textStartsWith(std::string_view value, std::string_view prefix, const TiDB::TiDBCollatorPtr & collator)
+{
+    if (!collator)
+        return value.starts_with(prefix);
+
+    // Reuse the same collation-aware pattern implementation as LIKE. Escape
+    // token characters that have LIKE meaning before appending the wildcard.
+    String pattern;
+    pattern.reserve(prefix.size() + 1);
+    for (const char c : prefix)
+    {
+        if (c == '\\' || c == '%' || c == '_')
+            pattern.push_back('\\');
+        pattern.push_back(c);
+    }
+    pattern.push_back('%');
+    auto matcher = collator->pattern();
+    matcher->compile(pattern, '\\');
+    return matcher->match(value.data(), value.size());
+}
+
 bool isBooleanWhitespace(char c)
 {
     return c == ' ' || c == '\t' || c == '\n' || c == '\r';
 }
 
-bool parseBooleanQuery(std::string_view query, std::vector<BooleanClause> & clauses)
+bool parseBooleanQuery(
+    std::string_view query,
+    std::vector<BooleanClause> & clauses,
+    const TiDB::TiDBCollatorPtr & collator = nullptr)
 {
     for (size_t i = 0; i < query.size();)
     {
@@ -215,7 +252,7 @@ bool parseBooleanQuery(std::string_view query, std::vector<BooleanClause> & clau
             }
         }
 
-        const auto terms = clause.prefix ? tokenizeText(raw) : analyzeText(raw);
+        const auto terms = clause.prefix ? tokenizeText(raw, collator) : analyzeText(raw, collator);
         if (clause.prefix && terms.size() != 1)
             continue;
 
@@ -239,7 +276,10 @@ bool parseBooleanQuery(std::string_view query, std::vector<BooleanClause> & clau
     return true;
 }
 
-bool matchesPhraseInColumn(const BooleanClause & clause, const FullTextColumn & document)
+bool matchesPhraseInColumn(
+    const BooleanClause & clause,
+    const FullTextColumn & document,
+    const TiDB::TiDBCollatorPtr & collator)
 {
     if (clause.terms.empty() || clause.terms.size() != clause.offsets.size())
         return false;
@@ -253,7 +293,7 @@ bool matchesPhraseInColumn(const BooleanClause & clause, const FullTextColumn & 
             const auto it = std::find_if(document.begin(), document.end(), [&](const FullTextToken & token) {
                 return token.position == expected_position;
             });
-            if (it == document.end() || it->text != clause.terms[i])
+            if (it == document.end() || !textEquals(it->text, clause.terms[i], collator))
             {
                 matched = false;
                 break;
@@ -265,28 +305,34 @@ bool matchesPhraseInColumn(const BooleanClause & clause, const FullTextColumn & 
     return false;
 }
 
-bool matchesClause(const BooleanClause & clause, const FullTextDocument & document)
+bool matchesClause(
+    const BooleanClause & clause,
+    const FullTextDocument & document,
+    const TiDB::TiDBCollatorPtr & collator)
 {
     if (clause.terms.empty())
         return false;
 
     if (clause.phrase)
         return std::any_of(document.begin(), document.end(), [&](const FullTextColumn & column) {
-            return matchesPhraseInColumn(clause, column);
+            return matchesPhraseInColumn(clause, column, collator);
         });
 
     return std::all_of(clause.terms.begin(), clause.terms.end(), [&](const String & term) {
         return std::any_of(document.begin(), document.end(), [&](const FullTextColumn & column) {
             return std::any_of(column.begin(), column.end(), [&](const FullTextToken & token) {
-                return clause.prefix ? token.text.starts_with(term) : token.text == term;
+                return clause.prefix ? textStartsWith(token.text, term, collator) : textEquals(token.text, term, collator);
             });
         });
     });
 }
 
-size_t countClauseMatches(const BooleanClause & clause, const FullTextDocument & document)
+size_t countClauseMatches(
+    const BooleanClause & clause,
+    const FullTextDocument & document,
+    const TiDB::TiDBCollatorPtr & collator)
 {
-    if (!matchesClause(clause, document))
+    if (!matchesClause(clause, document, collator))
         return 0;
 
     if (!clause.phrase)
@@ -297,7 +343,7 @@ size_t countClauseMatches(const BooleanClause & clause, const FullTextDocument &
             for (const auto & column : document)
             {
                 count += std::count_if(column.begin(), column.end(), [&](const FullTextToken & token) {
-                    return clause.prefix ? token.text.starts_with(term) : token.text == term;
+                    return clause.prefix ? textStartsWith(token.text, term, collator) : textEquals(token.text, term, collator);
                 });
             }
         }
@@ -316,7 +362,7 @@ size_t countClauseMatches(const BooleanClause & clause, const FullTextDocument &
                 const auto it = std::find_if(column.begin(), column.end(), [&](const FullTextToken & token) {
                     return token.position == expected_position;
                 });
-                if (it == column.end() || it->text != clause.terms[i])
+                if (it == column.end() || !textEquals(it->text, clause.terms[i], collator))
                 {
                     matched = false;
                     break;
@@ -329,12 +375,15 @@ size_t countClauseMatches(const BooleanClause & clause, const FullTextDocument &
     return count;
 }
 
-FullTextColumn analyzeColumn(std::string_view document)
+FullTextColumn analyzeColumn(std::string_view document, const TiDB::TiDBCollatorPtr & collator = nullptr)
 {
-    return analyzeText(document);
+    return analyzeText(document, collator);
 }
 
-Float64 matchBooleanScore(const std::vector<BooleanClause> & clauses, const FullTextDocument & document)
+Float64 matchBooleanScore(
+    const std::vector<BooleanClause> & clauses,
+    const FullTextDocument & document,
+    const TiDB::TiDBCollatorPtr & collator = nullptr)
 {
 	if (clauses.empty())
 		return 0;
@@ -345,8 +394,8 @@ Float64 matchBooleanScore(const std::vector<BooleanClause> & clauses, const Full
 	Float64 score = 0;
 	for (const auto & clause : clauses)
 	{
-		const bool matched = matchesClause(clause, document);
-		const auto clause_score = static_cast<Float64>(countClauseMatches(clause, document));
+        const bool matched = matchesClause(clause, document, collator);
+        const auto clause_score = static_cast<Float64>(countClauseMatches(clause, document, collator));
 		switch (clause.modifier)
 		{
 		case BooleanClause::Modifier::Must:
@@ -376,15 +425,21 @@ Float64 matchBooleanScore(const std::vector<BooleanClause> & clauses, const Full
 	return score > 0 ? score : 1;
 }
 
-Float64 matchBooleanScore(std::string_view query, const FullTextDocument & document)
+Float64 matchBooleanScore(
+    std::string_view query,
+    const FullTextDocument & document,
+    const TiDB::TiDBCollatorPtr & collator = nullptr)
 {
     std::vector<BooleanClause> clauses;
-    if (!parseBooleanQuery(query, clauses))
+    if (!parseBooleanQuery(query, clauses, collator))
         return 0;
-    return matchBooleanScore(clauses, document);
+    return matchBooleanScore(clauses, document, collator);
 }
 
-Float64 matchBooleanScore(const tipb::FTSBooleanQuery & query, const FullTextDocument & document)
+Float64 matchBooleanScore(
+    const tipb::FTSBooleanQuery & query,
+    const FullTextDocument & document,
+    const TiDB::TiDBCollatorPtr & collator = nullptr)
 {
 	std::vector<BooleanClause> clauses;
 	for (const auto & node : query.nodes())
@@ -412,13 +467,13 @@ Float64 matchBooleanScore(const tipb::FTSBooleanQuery & query, const FullTextDoc
 		switch (term.term_type())
 		{
 		case tipb::FTSBooleanTermType::FTSBooleanTermWord:
-			for (const auto & token : analyzeText(term.text()))
+            for (const auto & token : analyzeText(term.text(), collator))
 				clause.terms.push_back(token.text);
 			break;
 		case tipb::FTSBooleanTermType::FTSBooleanTermPrefix:
 		{
 			clause.prefix = true;
-			const auto terms = tokenizeText(term.text());
+            const auto terms = tokenizeText(term.text(), collator);
 			if (terms.size() != 1)
 			{
 				if (clause.modifier == BooleanClause::Modifier::Must)
@@ -440,7 +495,7 @@ Float64 matchBooleanScore(const tipb::FTSBooleanQuery & query, const FullTextDoc
 		case tipb::FTSBooleanTermType::FTSBooleanTermPhrase:
 		{
 			clause.phrase = true;
-			const auto terms = analyzeText(term.text());
+            const auto terms = analyzeText(term.text(), collator);
 			const size_t first_position = terms.empty() ? 0 : terms.front().position;
 			for (const auto & token : terms)
 			{
@@ -467,24 +522,33 @@ Float64 matchBooleanScore(const tipb::FTSBooleanQuery & query, const FullTextDoc
 	// The protocol path is the no-score MATCH ... AGAINST BOOLEAN MODE
 	// predicate introduced by #70484/#70485. TiDB's local evaluator returns
 	// a boolean 0/1 result, so do not expose term-frequency counts here.
-	return matchBooleanScore(clauses, document) > 0 ? 1 : 0;
+	return matchBooleanScore(clauses, document, collator) > 0 ? 1 : 0;
 }
 
-Float64 matchBooleanScore(std::string_view query, std::string_view document)
+Float64 matchBooleanScore(
+    std::string_view query,
+    std::string_view document,
+    const TiDB::TiDBCollatorPtr & collator = nullptr)
 {
-    return matchBooleanScore(query, FullTextDocument{analyzeColumn(document)});
+    return matchBooleanScore(query, FullTextDocument{analyzeColumn(document, collator)}, collator);
 }
 
-size_t countTermMatches(const String & term, const FullTextColumn & document)
+size_t countTermMatches(
+    const String & term,
+    const FullTextColumn & document,
+    const TiDB::TiDBCollatorPtr & collator)
 {
     return std::count_if(document.begin(), document.end(), [&](const FullTextToken & token) {
-        return token.text == term;
+        return textEquals(token.text, term, collator);
     });
 }
 
-Float64 matchNaturalLanguageScore(std::string_view query, const FullTextDocument & document)
+Float64 matchNaturalLanguageScore(
+    std::string_view query,
+    const FullTextDocument & document,
+    const TiDB::TiDBCollatorPtr & collator = nullptr)
 {
-    const auto query_tokens = analyzeText(query);
+    const auto query_tokens = analyzeText(query, collator);
     if (query_tokens.empty())
         return 0;
 
@@ -495,7 +559,7 @@ Float64 matchNaturalLanguageScore(std::string_view query, const FullTextDocument
         if (!unique_query_tokens.insert(query_token.text).second)
             continue;
         for (const auto & column : document)
-            score += static_cast<Float64>(countTermMatches(query_token.text, column));
+            score += static_cast<Float64>(countTermMatches(query_token.text, column, collator));
     }
     return score;
 }
@@ -562,6 +626,7 @@ public:
     size_t getNumberOfArguments() const override { return 2; }
     bool useDefaultImplementationForConstants() const override { return false; }
     ColumnNumbers getArgumentsThatAreAlwaysConstant() const override { return {0}; }
+    void setCollator(const TiDB::TiDBCollatorPtr & collator_) override { collator = collator_; }
 
     DataTypePtr getReturnTypeImpl(const DataTypes & arguments) const override
     {
@@ -607,7 +672,7 @@ public:
                 if (isNullAt(*document_column, row))
                     null_map_data[row] = 1;
                 else
-                    output_data[row] = matchBooleanScore(query, getStringAt(*document_column, row));
+                    output_data[row] = matchBooleanScore(query, getStringAt(*document_column, row), collator);
             }
             block.getByPosition(result).column = ColumnNullable::create(std::move(output), std::move(null_map));
             return;
@@ -622,14 +687,17 @@ public:
                 const size_t end = offsets[row];
                 const size_t length = end - begin - 1;
                 output_data[row]
-                    = matchBooleanScore(query, std::string_view(reinterpret_cast<const char *>(&chars[begin]), length));
+                    = matchBooleanScore(
+                        query,
+                        std::string_view(reinterpret_cast<const char *>(&chars[begin]), length),
+                        collator);
                 begin = end;
             }
         }
         else if (const auto * document = typeid_cast<const ColumnConst *>(&*document_column))
         {
             const auto value = document->getValue<String>();
-            const Float64 matched = matchBooleanScore(query, value);
+            const Float64 matched = matchBooleanScore(query, value, collator);
             std::fill(output_data.begin(), output_data.end(), matched);
         }
         else
@@ -640,6 +708,9 @@ public:
         }
         block.getByPosition(result).column = std::move(output);
     }
+
+private:
+    TiDB::TiDBCollatorPtr collator;
 };
 
 class FunctionFTSMatchExpression final : public IFunction
@@ -653,6 +724,7 @@ public:
     bool isVariadic() const override { return true; }
     bool useDefaultImplementationForConstants() const override { return false; }
     ColumnNumbers getArgumentsThatAreAlwaysConstant() const override { return {0}; }
+    void setCollator(const TiDB::TiDBCollatorPtr & collator_) override { collator = collator_; }
 
     DataTypePtr getReturnTypeImpl(const DataTypes & arguments) const override
     {
@@ -720,14 +792,15 @@ public:
                     document.emplace_back();
                     continue;
                 }
-                document.push_back(analyzeColumn(getStringAt(*block.getByPosition(arguments[arg]).column, row)));
+                document.push_back(
+                    analyzeColumn(getStringAt(*block.getByPosition(arguments[arg]).column, row), collator));
             }
             if (has_protocol_boolean_query)
-                output_data[row] = matchBooleanScore(protocol_boolean_query, document);
+                output_data[row] = matchBooleanScore(protocol_boolean_query, document, collator);
             else if (queryUsesBooleanSyntax(query))
-                output_data[row] = matchBooleanScore(query, document);
+                output_data[row] = matchBooleanScore(query, document, collator);
             else
-                output_data[row] = matchNaturalLanguageScore(query, document);
+                output_data[row] = matchNaturalLanguageScore(query, document, collator);
         }
         ColumnPtr result_column;
         if (null_map)
@@ -736,6 +809,9 @@ public:
             result_column = std::move(output);
         block.getByPosition(result).column = std::move(result_column);
     }
+
+private:
+    TiDB::TiDBCollatorPtr collator;
 };
 }
 
