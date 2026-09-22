@@ -3,8 +3,9 @@
 ## Implementation status
 
 This document describes the implementation currently on the `match_against`
-branch. The verified TiFlash commit is `55c2b6810c`:
-`fts: support nullable MATCH columns in TiFlash`.
+branch. The verified TiFlash commit is `b6f1477fa1` on `origin/match_against`.
+It includes the Boolean pushdown implementation, nullable MATCH-column
+handling, and the current design-document update.
 
 The delivery target is the release-8.5 family and the supported product
 surface is:
@@ -13,10 +14,12 @@ surface is:
 MATCH(col) AGAINST('+tidb -mysql' IN BOOLEAN MODE)
 ```
 
-The implementation is a snapshot-local scan evaluator. It does not require a
-FULLTEXT index and it is not an inverted-index implementation. TiFlash is
-used when a table has an available replica; without a TiFlash replica, TiDB
-uses its local evaluator through the normal TiKV read path.
+The implementation is a snapshot-local scan evaluator. TiFlash does not read
+or maintain a physical FULLTEXT inverted index in this phase. TiDB still
+requires a public FULLTEXT index as planner metadata and as the source of the
+parser configuration. TiFlash is used when a table has an available replica;
+without a TiFlash replica, TiDB uses its local evaluator through the normal
+TiKV read path.
 
 ## Introduction
 
@@ -102,10 +105,11 @@ of tokens and compares terms through the TiDB collator. This makes matching
 case and accent behavior follow the column collation. Prefix matching reuses
 the same collator-aware comparison path.
 
-The local TiDB fallback is a separate implementation. The current fallback
-still lower-cases tokens and therefore does not fully preserve
-`utf8mb4_bin` case sensitivity. This is a TiDB-side consistency limitation;
-it is not changed by the TiFlash implementation.
+The local TiDB fallback is a separate implementation, but it now receives the
+MATCH column collation in its analyzer configuration and uses the same
+collator-aware token, prefix, and phrase comparisons. The fallback therefore
+preserves the tested `utf8mb4_bin`, `utf8mb4_general_ci`, and
+`utf8mb4_0900_ai_ci` behavior when TiFlash is unavailable.
 
 ### Nullable columns
 
@@ -152,7 +156,8 @@ WHERE MATCH(body) AGAINST('+tidb -mysql' IN BOOLEAN MODE)
 ORDER BY id;
 ```
 
-returned rows `2`, `4`, and `6`. Its plan was:
+returned row `2` with the data set used for the release-8.5 verification. Its
+plan was:
 
 ```text
 TableReader
@@ -161,7 +166,7 @@ TableReader
 ```
 
 There was no root `Selection(match_against(...))`. `EXPLAIN ANALYZE` showed
-three actual output rows from the TiFlash task.
+five rows scanned and one row output by the TiFlash task.
 
 The currently supported TiDB collations were tested on TiFlash:
 
@@ -194,7 +199,9 @@ Selection
 ```
 
 This confirms the TiDB fallback path remains available when TiFlash cannot be
-used.
+used and returns the same result as the native path. The fallback E2E also
+verified that `utf8mb4_bin` distinguishes case while CI/AI collations match
+the expected case and accent variants.
 
 ### Compatibility Tests
 
@@ -218,9 +225,11 @@ supported by this phase.
 
 The scan evaluator currently does not perform inverted-index lookup or
 rough-set pruning for FTS. Large tables may therefore scan many rows even
-when the final MATCH result is small. Chinese/CJK tokenization is also not
-claimed by this phase; the tested STANDARD_V1 sample produced no match for a
-Chinese term on both TiFlash and the TiDB fallback.
+when the final MATCH result is small. Chinese/CJK behavior follows the
+STANDARD_V1 tokenization and default minimum token length: the tested
+`+数据库` query matched standalone `数据库` tokens, while the two-character
+`+中文` query was filtered by the default minimum token length. This phase
+does not claim general Chinese linguistic segmentation.
 
 ## Investigation & Alternatives
 
