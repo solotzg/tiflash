@@ -104,6 +104,27 @@ try
 }
 CATCH
 
+TEST_F(TestFullText, MatchExpressionMultiColumnNullable)
+try
+{
+    tipb::FTSBooleanQuery boolean_query;
+    auto * required = boolean_query.add_nodes();
+    required->set_occur(tipb::FTSBooleanOccurMust);
+    required->mutable_term()->set_term_type(tipb::FTSBooleanTermWord);
+    required->mutable_term()->set_text("quick");
+
+    const String metadata = "__tiflash_fts_bool_query__:" + boolean_query.SerializeAsString();
+    ASSERT_COLUMN_EQ(
+        createColumn<Nullable<Float64>>({1, 1, 0, 0}),
+        executeFunction(
+            "fts_match_expression",
+            {createConstColumn<String>(4, "+quick"),
+             createColumn<Nullable<String>>({{}, "quick fox", {}, "slow fox"}),
+             createColumn<Nullable<String>>({"quick fox", {}, "slow fox", {}}),
+             createConstColumn<String>(4, metadata)}));
+}
+CATCH
+
 TEST_F(TestFullText, MatchExpressionProtocolBooleanQuery)
 try
 {

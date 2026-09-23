@@ -8,12 +8,18 @@ and TiUP playground v8.5.8. It includes Boolean pushdown, STANDARD_V1 and
 NGRAM_V1 analysis, nullable MATCH-column handling, and collation-aware
 fallback behavior.
 
-The delivery target is the release-8.5 family and the supported product
-surface is:
+The delivery target is the release-8.5 family. The supported product surface
+is single- or multi-column MATCH in BOOLEAN MODE, provided the TiDB planner can
+resolve one matching public FULLTEXT index:
 
 ```sql
 MATCH(col) AGAINST('+tidb -mysql' IN BOOLEAN MODE)
+MATCH(title, body) AGAINST('+tidb -mysql' IN BOOLEAN MODE)
 ```
+
+For multi-column queries, the ordered MATCH column list must exactly match the
+columns of one public composite FULLTEXT index on the same table. Independent
+single-column indexes do not qualify for native TiFlash pushdown.
 
 The implementation is a snapshot-local scan evaluator. TiFlash does not read
 or maintain a physical FULLTEXT inverted index in this phase. TiDB still
@@ -58,8 +64,11 @@ TiFlash maps the two scalar signatures as follows:
 | `FTSMatchExpression` | `fts_match_expression` | Boolean-aware evaluator over MATCH columns |
 
 For the #70484/#70485 boolean predicate, TiDB serializes a `FTSQueryInfo`
-into the table scan. `TiDBTableScan` extracts it and `PhysicalTableScan`
-builds an `fts_match_expression` filter containing:
+into the table scan. For native pushdown, the MATCH columns must resolve in
+order to one public composite FULLTEXT index on the same table; this prevents
+the planner from substituting unrelated per-column indexes. `TiDBTableScan`
+extracts the query and `PhysicalTableScan` builds an `fts_match_expression`
+filter containing:
 
 1. the original query text;
 2. MATCH column references and their TiDB field types;
@@ -147,6 +156,15 @@ MATCH columns, collation behavior, and unsupported score modifiers. The
 `MatchExpressionCollationMatrix` case covers `utf8mb4_bin`,
 `utf8mb4_0900_bin`, `utf8mb4_general_ci`, `utf8mb4_unicode_ci`, and
 `utf8mb4_0900_ai_ci` for both ordinary terms and prefix terms.
+
+On 2026-09-23, the `gtests_dbms --gtest_filter='TestFullText.*'` suite passed
+all 14 tests. This includes regressions for parsing `run*` as a prefix query
+and matching `+run*` against `RUNNER` under a case-insensitive collation. The
+fix was in Boolean query parsing: the scanner stopped before `*` but did not
+attach it to the preceding term. TiUP SQL E2E was not rerun after this parser
+change; the E2E results below are from the earlier validation run. The
+multi-column planner resolver and TiFlash evaluator have targeted unit
+coverage, but multi-column MATCH has not yet been verified through TiUP SQL.
 
 ### Local E2E validation
 
@@ -253,8 +271,9 @@ and index-reader change set.
 
 ## Remaining work
 
-Before product release, the paired TiDB branch and TiFlash branch still need
-CI coverage, release-8.5 build verification, and code review. If exact
+Before product release, multi-column MATCH still needs TiUP SQL E2E coverage;
+the paired TiDB branch and TiFlash branch also need CI coverage, release-8.5
+build verification, and code review. If exact
 corpus-wide ranking or index-level performance is required, a future phase
 must define a relevance-score contract and add a native DeltaMerge full-text
 index.

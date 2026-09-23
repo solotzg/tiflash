@@ -289,10 +289,14 @@ bool parseBooleanQuery(
             if (start == i)
                 return false;
             raw.assign(query.substr(start, i - start));
-            if (!raw.empty() && raw.back() == '*')
+            // The scan above stops before `*`, so consume the wildcard here
+            // and attach prefix semantics to this term. Leaving it for the
+            // next iteration incorrectly turns `run*` into an exact `run`
+            // match (and makes it fail against `runner`).
+            if (i < query.size() && query[i] == '*')
             {
                 clause.prefix = true;
-                raw.pop_back();
+                ++i;
             }
         }
 
@@ -833,6 +837,10 @@ public:
     size_t getNumberOfArguments() const override { return 0; }
     bool isVariadic() const override { return true; }
     bool useDefaultImplementationForConstants() const override { return false; }
+    // NULL MATCH columns are empty documents, not NULL MATCH results. The
+    // implementation below handles nullable columns per row, so the generic
+    // IFunction NULL wrapper must not short-circuit the whole expression.
+    bool useDefaultImplementationForNulls() const override { return false; }
     ColumnNumbers getArgumentsThatAreAlwaysConstant() const override { return {0}; }
     void setCollator(const TiDB::TiDBCollatorPtr & collator_) override { collator = collator_; }
 
