@@ -143,7 +143,10 @@ provide corpus-wide IDF normalization.
 
 `dbms/src/Functions/tests/gtest_fulltext.cpp` covers required/prohibited terms,
 phrases with stopword gaps, prefixes, word boundaries, nullable input, NULL
-MATCH columns, collation behavior, and unsupported score modifiers.
+MATCH columns, collation behavior, and unsupported score modifiers. The
+`MatchExpressionCollationMatrix` case covers `utf8mb4_bin`,
+`utf8mb4_0900_bin`, `utf8mb4_general_ci`, `utf8mb4_unicode_ci`, and
+`utf8mb4_0900_ai_ci` for both ordinary terms and prefix terms.
 
 ### Local E2E validation
 

@@ -224,6 +224,68 @@ try
 }
 CATCH
 
+TEST_F(TestFullText, MatchExpressionCollationMatrix)
+try
+{
+    const auto query = createConstColumn<String>(3, "+cafe");
+    const auto documents = createColumn<String>({"CAFE", "café", "cafe"});
+    const auto prefix_query = createConstColumn<String>(3, "+caf*");
+    const auto make_metadata = [](tipb::FTSBooleanTermType term_type, const String & term) {
+        tipb::FTSBooleanQuery boolean_query;
+        boolean_query.set_query_tokenizer("STANDARD_V1");
+        auto * node = boolean_query.add_nodes();
+        node->set_occur(tipb::FTSBooleanOccurMust);
+        node->mutable_term()->set_term_type(term_type);
+        node->mutable_term()->set_text(term);
+        return String("__tiflash_fts_bool_query__:") + boolean_query.SerializeAsString();
+    };
+    const auto word_metadata = createConstColumn<String>(
+        3, make_metadata(tipb::FTSBooleanTermWord, "cafe"));
+    const auto prefix_metadata = createConstColumn<String>(
+        3, make_metadata(tipb::FTSBooleanTermPrefix, "caf"));
+
+    const auto utf8mb4_bin = TiDB::ITiDBCollator::getCollator(TiDB::ITiDBCollator::UTF8MB4_BIN);
+    ASSERT_COLUMN_EQ(
+        createColumn<Float64>({0, 0, 1}),
+        executeFunction("fts_match_expression", {query, documents, word_metadata}, utf8mb4_bin));
+    ASSERT_COLUMN_EQ(
+        createColumn<Float64>({0, 1, 1}),
+        executeFunction("fts_match_expression", {prefix_query, documents, prefix_metadata}, utf8mb4_bin));
+
+    const auto utf8mb4_0900_bin = TiDB::ITiDBCollator::getCollator(TiDB::ITiDBCollator::UTF8MB4_0900_BIN);
+    ASSERT_COLUMN_EQ(
+        createColumn<Float64>({0, 0, 1}),
+        executeFunction("fts_match_expression", {query, documents, word_metadata}, utf8mb4_0900_bin));
+    ASSERT_COLUMN_EQ(
+        createColumn<Float64>({0, 1, 1}),
+        executeFunction("fts_match_expression", {prefix_query, documents, prefix_metadata}, utf8mb4_0900_bin));
+
+    const auto utf8mb4_general_ci = TiDB::ITiDBCollator::getCollator(TiDB::ITiDBCollator::UTF8MB4_GENERAL_CI);
+    ASSERT_COLUMN_EQ(
+        createColumn<Float64>({1, 1, 1}),
+        executeFunction("fts_match_expression", {query, documents, word_metadata}, utf8mb4_general_ci));
+    ASSERT_COLUMN_EQ(
+        createColumn<Float64>({1, 1, 1}),
+        executeFunction("fts_match_expression", {prefix_query, documents, prefix_metadata}, utf8mb4_general_ci));
+
+    const auto utf8mb4_unicode_ci = TiDB::ITiDBCollator::getCollator(TiDB::ITiDBCollator::UTF8MB4_UNICODE_CI);
+    ASSERT_COLUMN_EQ(
+        createColumn<Float64>({1, 1, 1}),
+        executeFunction("fts_match_expression", {query, documents, word_metadata}, utf8mb4_unicode_ci));
+    ASSERT_COLUMN_EQ(
+        createColumn<Float64>({1, 1, 1}),
+        executeFunction("fts_match_expression", {prefix_query, documents, prefix_metadata}, utf8mb4_unicode_ci));
+
+    const auto utf8mb4_0900_ai_ci = TiDB::ITiDBCollator::getCollator(TiDB::ITiDBCollator::UTF8MB4_0900_AI_CI);
+    ASSERT_COLUMN_EQ(
+        createColumn<Float64>({1, 1, 1}),
+        executeFunction("fts_match_expression", {query, documents, word_metadata}, utf8mb4_0900_ai_ci));
+    ASSERT_COLUMN_EQ(
+        createColumn<Float64>({1, 1, 1}),
+        executeFunction("fts_match_expression", {prefix_query, documents, prefix_metadata}, utf8mb4_0900_ai_ci));
+}
+CATCH
+
 TEST_F(TestFullText, MatchExpressionNullColumn)
 try
 {
