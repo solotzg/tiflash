@@ -3,9 +3,10 @@
 ## Implementation status
 
 This document describes the implementation currently on the `match_against`
-branch. The verified TiFlash commit is `b6f1477fa1` on `origin/match_against`.
-It includes the Boolean pushdown implementation, nullable MATCH-column
-handling, and the current design-document update.
+branch. Validation was performed with the release-8.5 TiDB/TiFlash branches
+and TiUP playground v8.5.8. It includes Boolean pushdown, STANDARD_V1 and
+NGRAM_V1 analysis, nullable MATCH-column handling, and collation-aware
+fallback behavior.
 
 The delivery target is the release-8.5 family and the supported product
 surface is:
@@ -43,9 +44,11 @@ index.
 ### Protocol and planner path
 
 The `contrib/tipb` submodule is pinned to the FTS protocol commit
-`0a9c803d4e` on the `release-8.5-match-against` line. The protocol carries
+`26695da26e` on the `release-8.5-match-against` line. The protocol carries
 `ScalarFuncSig_FTSMatchWord`, `ScalarFuncSig_FTSMatchExpression`,
-`FTSQueryInfo`, `FTSBooleanQuery`, and `used_columnar_indexes`.
+`FTSQueryInfo`, `FTSBooleanQuery`, and `used_columnar_indexes`. `FTSBooleanQuery`
+also carries `query_tokenizer` and `ngram_token_size`, so TiFlash uses the
+same analyzer selected by the FULLTEXT index and TiDB session configuration.
 
 TiFlash maps the two scalar signatures as follows:
 
@@ -76,13 +79,14 @@ predicate itself is still evaluated successfully by the TiFlash scan.
 
 ### Analyzer and matcher
 
-The evaluator implements the STANDARD_V1-compatible Boolean matching subset
+The evaluator implements the STANDARD_V1 and NGRAM_V1 Boolean matching subset
 used by #70484/#70485:
 
-- Unicode letter/number token runs with `_` preserved;
-- Unicode lower-casing when no protocol collator is available;
-- default token length range 3..84;
-- the default InnoDB stopword set;
+- Both analyzers recognize Unicode letter/number token runs with `_` preserved;
+- STANDARD_V1 uses Unicode lower-casing when no protocol collator is available,
+  a default token length range of 3..84, and the default InnoDB stopword set;
+- NGRAM_V1 emits fixed-size Unicode code-point ngrams. The token size is read
+  from `ngram_token_size`, whose release-8.5 default is 2;
 - Boolean `+` required terms, `-` prohibited terms, quoted phrases, and a
   trailing `*` prefix;
 - phrase positions are retained across analyzer filtering, so removed
@@ -199,9 +203,16 @@ Selection
 ```
 
 This confirms the TiDB fallback path remains available when TiFlash cannot be
-used and returns the same result as the native path. The fallback E2E also
-verified that `utf8mb4_bin` distinguishes case while CI/AI collations match
-the expected case and accent variants.
+used and returns the same result as the native path after
+`tidb_enable_local_match_against` is enabled. With the session variable left
+`OFF`, TiDB intentionally returns the existing error requiring either a
+TiFlash FULLTEXT replica or local MATCH AGAINST evaluation.
+
+The NGRAM E2E used a public FULLTEXT index with `WITH PARSER NGRAM`,
+`ngram_token_size = 2`, and the query `+数据库 -mysql`. TiFlash pushdown and
+TiDB fallback returned identical rows under both `utf8mb4_bin` and
+`utf8mb4_general_ci`; the binary collation remained case-sensitive while the
+CI collation matched `mysql` and `MySQL` equivalently.
 
 ### Compatibility Tests
 
@@ -218,18 +229,17 @@ index-accelerated search.
 ## Impacts & Risks
 
 The implementation adds per-row tokenization and matching CPU cost. Its score
-is deterministic but is not a native MySQL relevance score. Custom analyzer
-sysvars, custom stopword lists, NGRAM_V1, and non-default `AGAINST` modifiers
-are not represented in the current wire contract and must not be treated as
-supported by this phase.
+is deterministic but is not a native MySQL relevance score. Custom stopword
+lists and non-default `AGAINST` modifiers are not represented in the current
+wire contract and must not be treated as supported by this phase. NGRAM_V1 is
+supported for the configured `ngram_token_size`; it is still a scan evaluator,
+not an inverted-index implementation.
 
 The scan evaluator currently does not perform inverted-index lookup or
 rough-set pruning for FTS. Large tables may therefore scan many rows even
-when the final MATCH result is small. Chinese/CJK behavior follows the
-STANDARD_V1 tokenization and default minimum token length: the tested
-`+数据库` query matched standalone `数据库` tokens, while the two-character
-`+中文` query was filtered by the default minimum token length. This phase
-does not claim general Chinese linguistic segmentation.
+when the final MATCH result is small. STANDARD_V1 Chinese/CJK behavior follows
+its default minimum token length, while NGRAM_V1 handles CJK through fixed-size
+code-point windows. This phase does not claim general linguistic segmentation.
 
 ## Investigation & Alternatives
 

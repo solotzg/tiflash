@@ -49,7 +49,9 @@ namespace
 {
 constexpr size_t default_min_token_size = 3;
 constexpr size_t default_max_token_size = 84;
-constexpr std::string_view fts_boolean_query_marker = "__tiflash_fts_boolean_query__:";
+constexpr size_t default_ngram_token_size = 2;
+constexpr std::string_view ngram_parser = "NGRAM_V1";
+constexpr std::string_view fts_boolean_query_marker = "__tiflash_fts_bool_query__:";
 
 struct FullTextToken
 {
@@ -147,6 +149,48 @@ std::vector<FullTextToken> analyzeText(std::string_view text, const TiDB::TiDBCo
         if (code_points >= default_min_token_size && code_points <= default_max_token_size
             && !isDefaultStopword(token.text))
             result.push_back(std::move(token));
+    }
+    return result;
+}
+
+std::vector<FullTextToken> analyzeNgramText(
+    std::string_view text,
+    size_t ngram_token_size,
+    const TiDB::TiDBCollatorPtr & collator = nullptr)
+{
+    if (ngram_token_size == 0)
+        return {};
+
+    std::vector<FullTextToken> result;
+    size_t next_position_base = 0;
+    for (auto & token : tokenizeText(text, collator))
+    {
+        std::vector<size_t> char_boundaries;
+        char_boundaries.reserve(token.text.size() + 1);
+        char_boundaries.push_back(0);
+        for (size_t offset = 0; offset < token.text.size();)
+        {
+            const auto [code_point, length] = decodeCodePoint(token.text, offset);
+            (void)code_point;
+            offset += length;
+            char_boundaries.push_back(offset);
+        }
+
+        const size_t char_count = char_boundaries.size() - 1;
+        const size_t base_position = std::max(token.position, next_position_base);
+        if (char_count < ngram_token_size)
+        {
+            next_position_base = std::max(next_position_base, token.position + 1);
+            continue;
+        }
+
+        for (size_t start = 0; start + ngram_token_size <= char_count; ++start)
+        {
+            const size_t begin = char_boundaries[start];
+            const size_t end = char_boundaries[start + ngram_token_size];
+            result.push_back({token.text.substr(begin, end - begin), base_position + start});
+        }
+        next_position_base = base_position + char_count - ngram_token_size + 1;
     }
     return result;
 }
@@ -380,6 +424,15 @@ FullTextColumn analyzeColumn(std::string_view document, const TiDB::TiDBCollator
     return analyzeText(document, collator);
 }
 
+FullTextColumn analyzeColumn(
+    std::string_view document,
+    bool use_ngram,
+    size_t ngram_token_size,
+    const TiDB::TiDBCollatorPtr & collator = nullptr)
+{
+    return use_ngram ? analyzeNgramText(document, ngram_token_size, collator) : analyzeText(document, collator);
+}
+
 Float64 matchBooleanScore(
     const std::vector<BooleanClause> & clauses,
     const FullTextDocument & document,
@@ -422,7 +475,42 @@ Float64 matchBooleanScore(
 		return 0;
 	// A query containing only prohibited terms has no positive term to score,
 	// but an accepted row still has to pass the boolean filter.
-	return score > 0 ? score : 1;
+    return score > 0 ? score : 1;
+}
+
+bool matchBooleanPredicate(
+    const std::vector<BooleanClause> & clauses,
+    const FullTextDocument & document,
+    const TiDB::TiDBCollatorPtr & collator = nullptr)
+{
+    if (clauses.empty())
+        return false;
+
+    bool has_positive = false;
+    bool has_must = false;
+    bool positive_match = false;
+    for (const auto & clause : clauses)
+    {
+        const bool matched = matchesClause(clause, document, collator);
+        switch (clause.modifier)
+        {
+        case BooleanClause::Modifier::Must:
+            has_must = true;
+            if (!matched)
+                return false;
+            break;
+        case BooleanClause::Modifier::MustNot:
+            if (matched)
+                return false;
+            break;
+        case BooleanClause::Modifier::Should:
+            has_positive = true;
+            positive_match = positive_match || matched;
+            break;
+        }
+    }
+
+    return has_must || !has_positive || positive_match;
 }
 
 Float64 matchBooleanScore(
@@ -442,6 +530,11 @@ Float64 matchBooleanScore(
     const TiDB::TiDBCollatorPtr & collator = nullptr)
 {
 	std::vector<BooleanClause> clauses;
+	const bool use_ngram = query.query_tokenizer() == ngram_parser;
+	const size_t ngram_token_size = query.ngram_token_size() == 0 ? default_ngram_token_size : query.ngram_token_size();
+	auto analyze_query = [&](std::string_view text) {
+		return use_ngram ? analyzeNgramText(text, ngram_token_size, collator) : analyzeText(text, collator);
+	};
 	for (const auto & node : query.nodes())
 	{
 		if (!node.has_term())
@@ -467,13 +560,30 @@ Float64 matchBooleanScore(
 		switch (term.term_type())
 		{
 		case tipb::FTSBooleanTermType::FTSBooleanTermWord:
-            for (const auto & token : analyzeText(term.text(), collator))
-				clause.terms.push_back(token.text);
+		{
+			const auto terms = analyze_query(term.text());
+			if (use_ngram)
+			{
+				clause.phrase = true;
+				const size_t first_position = terms.empty() ? 0 : terms.front().position;
+				for (const auto & token : terms)
+				{
+					clause.terms.push_back(token.text);
+					clause.offsets.push_back(token.position - first_position);
+				}
+			}
+			else
+			{
+				for (const auto & token : terms)
+					clause.terms.push_back(token.text);
+			}
 			break;
+		}
 		case tipb::FTSBooleanTermType::FTSBooleanTermPrefix:
 		{
 			clause.prefix = true;
-            const auto terms = tokenizeText(term.text(), collator);
+			const auto terms = use_ngram ? analyzeNgramText(term.text(), ngram_token_size, collator)
+										 : tokenizeText(term.text(), collator);
 			if (terms.size() != 1)
 			{
 				if (clause.modifier == BooleanClause::Modifier::Must)
@@ -495,7 +605,7 @@ Float64 matchBooleanScore(
 		case tipb::FTSBooleanTermType::FTSBooleanTermPhrase:
 		{
 			clause.phrase = true;
-            const auto terms = analyzeText(term.text(), collator);
+			const auto terms = analyze_query(term.text());
 			const size_t first_position = terms.empty() ? 0 : terms.front().position;
 			for (const auto & token : terms)
 			{
@@ -522,7 +632,7 @@ Float64 matchBooleanScore(
 	// The protocol path is the no-score MATCH ... AGAINST BOOLEAN MODE
 	// predicate introduced by #70484/#70485. TiDB's local evaluator returns
 	// a boolean 0/1 result, so do not expose term-frequency counts here.
-	return matchBooleanScore(clauses, document, collator) > 0 ? 1 : 0;
+	return matchBooleanPredicate(clauses, document, collator) ? 1 : 0;
 }
 
 Float64 matchBooleanScore(
@@ -777,6 +887,10 @@ public:
             && decodeFTSBooleanQuery(*block.getByPosition(arguments.back()).column, protocol_boolean_query);
         if (has_protocol_boolean_query)
             --document_argument_end;
+        const bool use_ngram = has_protocol_boolean_query && protocol_boolean_query.query_tokenizer() == ngram_parser;
+        const size_t ngram_token_size = !use_ngram || protocol_boolean_query.ngram_token_size() == 0
+            ? default_ngram_token_size
+            : protocol_boolean_query.ngram_token_size();
 
         for (size_t row = 0; row < rows; ++row)
         {
@@ -793,7 +907,11 @@ public:
                     continue;
                 }
                 document.push_back(
-                    analyzeColumn(getStringAt(*block.getByPosition(arguments[arg]).column, row), collator));
+                    analyzeColumn(
+                        getStringAt(*block.getByPosition(arguments[arg]).column, row),
+                        use_ngram,
+                        ngram_token_size,
+                        collator));
             }
             if (has_protocol_boolean_query)
                 output_data[row] = matchBooleanScore(protocol_boolean_query, document, collator);

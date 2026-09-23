@@ -117,7 +117,7 @@ try
     prohibited->mutable_term()->set_term_type(tipb::FTSBooleanTermWord);
     prohibited->mutable_term()->set_text("slow");
 
-    const String metadata = "__tiflash_fts_boolean_query__:" + boolean_query.SerializeAsString();
+    const String metadata = "__tiflash_fts_bool_query__:" + boolean_query.SerializeAsString();
     ASSERT_COLUMN_EQ(
         createColumn<Float64>({1, 0, 0}),
         executeFunction(
@@ -131,7 +131,7 @@ try
     prohibited_only->set_occur(tipb::FTSBooleanOccurMustNot);
     prohibited_only->mutable_term()->set_term_type(tipb::FTSBooleanTermWord);
     prohibited_only->mutable_term()->set_text("slow");
-    const String prohibited_metadata = "__tiflash_fts_boolean_query__:" + prohibited_query.SerializeAsString();
+    const String prohibited_metadata = "__tiflash_fts_bool_query__:" + prohibited_query.SerializeAsString();
     ASSERT_COLUMN_EQ(
         createColumn<Float64>({0, 0, 0}),
         executeFunction(
@@ -139,6 +139,48 @@ try
             {createConstColumn<String>(3, "-slow"),
              createColumn<String>({"quick brown", "slow fox", "brown fox"}),
              createConstColumn<String>(3, prohibited_metadata)}));
+}
+CATCH
+
+TEST_F(TestFullText, MatchExpressionNgramProtocolBooleanQuery)
+try
+{
+    tipb::FTSBooleanQuery boolean_query;
+    boolean_query.set_query_tokenizer("NGRAM_V1");
+    boolean_query.set_ngram_token_size(2);
+    auto * required = boolean_query.add_nodes();
+    required->set_occur(tipb::FTSBooleanOccurMust);
+    required->mutable_term()->set_term_type(tipb::FTSBooleanTermWord);
+    required->mutable_term()->set_text("数据库");
+    auto * prohibited = boolean_query.add_nodes();
+    prohibited->set_occur(tipb::FTSBooleanOccurMustNot);
+    prohibited->mutable_term()->set_term_type(tipb::FTSBooleanTermWord);
+    prohibited->mutable_term()->set_text("mysql");
+
+    const String metadata = "__tiflash_fts_bool_query__:" + boolean_query.SerializeAsString();
+    ASSERT_COLUMN_EQ(
+        createColumn<Float64>({1, 0, 1, 0}),
+        executeFunction(
+            "fts_match_expression",
+            {createConstColumn<String>(4, "+数据库 -mysql"),
+             createColumn<String>({"数据库系统", "MySQL 数据库", "数据库", "数据科学"}),
+             createConstColumn<String>(4, metadata)}));
+
+    const auto ci_collator = TiDB::ITiDBCollator::getCollator(TiDB::ITiDBCollator::UTF8MB4_GENERAL_CI);
+    tipb::FTSBooleanQuery case_query;
+    case_query.set_query_tokenizer("NGRAM_V1");
+    case_query.set_ngram_token_size(2);
+    auto * case_term = case_query.add_nodes();
+    case_term->set_occur(tipb::FTSBooleanOccurMust);
+    case_term->mutable_term()->set_term_type(tipb::FTSBooleanTermWord);
+    case_term->mutable_term()->set_text("mysql");
+    const String case_metadata = "__tiflash_fts_bool_query__:" + case_query.SerializeAsString();
+    ASSERT_COLUMN_EQ(
+        createColumn<Float64>({1, 0}),
+        executeFunction(
+            "fts_match_expression",
+            {createConstColumn<String>(2, "+mysql"), createColumn<String>({"MySQL", "PostgreSQL"}), createConstColumn<String>(2, case_metadata)},
+            ci_collator));
 }
 CATCH
 

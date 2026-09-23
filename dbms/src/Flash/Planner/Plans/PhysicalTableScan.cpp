@@ -37,7 +37,7 @@ namespace DB
 {
 namespace
 {
-constexpr std::string_view fts_boolean_query_marker = "__tiflash_fts_boolean_query__:";
+constexpr std::string_view fts_boolean_query_marker = "__tiflash_fts_bool_query__:";
 
 tipb::Expr buildFTSExpression(const TiDBTableScan & table_scan, Int32 result_type)
 {
